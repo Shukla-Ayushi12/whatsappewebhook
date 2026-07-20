@@ -1,1016 +1,598 @@
+"""
+WhatsPrep WhatsApp webhook.
+
+Converts the CLI flow into a state machine. Each inbound WhatsApp message
+advances one step. Run: uvicorn main:app --host 0.0.0.0 --port $PORT
+"""
+
+import os
 import re
 import json
-import os
-from openai import OpenAI
-import gspread
-from google.oauth2.service_account import Credentials
-from datetime import datetime
-from student_registry import StudentRegistry
-from dotenv import load_dotenv
+import httpx
 import requests
+from datetime import datetime
 
-# --- Load environment variables ---
+from fastapi import FastAPI, Request, Response, BackgroundTasks
+from openai import OpenAI
+from dotenv import load_dotenv
+
+from student_registry import StudentRegistry
+
 load_dotenv()
+app = FastAPI()
 
-# --- OpenAI setup ---
+# ---------------------------------------------------------------- config
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
-# --- Google Sheets setup ---
-SCOPES = [
-    "https://www.googleapis.com/auth/spreadsheets",
-    "https://www.googleapis.com/auth/drive"
-]
-
-SHEET_URL = os.getenv("SHEET_URL")
-CREDENTIALS_FILE = "credentials.json"
-
-PLATFORM_API_KEY = os.getenv("PLATFORM_API_KEY")
-if not PLATFORM_API_KEY:
-    raise RuntimeError("PLATFORM_API_KEY not set in .env")
+VERIFY_TOKEN = os.getenv("VERIFY_TOKEN")
+ACCESS_TOKEN = os.getenv("META_ACCESS_TOKEN")
+PHONE_NUMBER_ID = os.getenv("PHONE_NUMBER_ID")
+GRAPH_URL = f"https://graph.facebook.com/v21.0/{PHONE_NUMBER_ID}/messages"
 
 registry = StudentRegistry(
-    api_key=PLATFORM_API_KEY,
-    base_url=os.getenv("WHATSPREP_BASE_URL", "https://latam.whatsprep.com/api")
+    api_key=os.getenv("WHATSPREP_API_KEY"),
+    base_url="https://latam.whatsprep.com/api",
 )
-# --- Local database file ---
+
 DB_FILE = "students.json"
 
-# --- Session memory ---
-session = {}
+# phone -> {"step": str, "data": dict}
+SESSIONS: dict[str, dict] = {}
 
-# --- Google Sheets client (optional) ---
-students_sheet = None
-
-
-# ─────────────────────────────────────────
-# GOOGLE SHEETS FUNCTIONS
-# ─────────────────────────────────────────
-
-def get_sheets():
-    try:
-        creds = Credentials.from_service_account_file(CREDENTIALS_FILE, scopes=SCOPES)
-        gc = gspread.authorize(creds)
-        spreadsheet = gc.open_by_url(SHEET_URL)
-        sheet = spreadsheet.worksheet("Students")
-        if not sheet.row_values(1):
-            sheet.append_row(["Student ID", "Name", "Primary Level", "Gender", "Phone", "Date Joined"])
-        print("📊 Connected to Google Sheets!")
-        return sheet
-    except FileNotFoundError:
-        print("⚠️  credentials.json not found. Skipping Google Sheets.")
-        return None
-    except gspread.exceptions.SpreadsheetNotFound:
-        print("⚠️  Google Sheet not found. Skipping Google Sheets.")
-        return None
-    except Exception as e:
-        print(f"⚠️  Could not connect to Google Sheets: {e}. Continuing without it.")
-        return None
+LEVELS = ["Primary 1", "Primary 2", "Primary 3",
+          "Primary 4", "Primary 5", "Primary 6"]
 
 
-def save_student_to_sheets(sheet, name, level, gender, phone):
-    if not sheet:
-        return None
-    try:
-        all_students = sheet.get_all_records()
-        student_id = f"S{len(all_students) + 1:04d}"
-        sheet.append_row([student_id, name, level, gender, phone,
-                          datetime.now().strftime("%Y-%m-%d %H:%M:%S")])
-        print(f"📊 Student saved to Google Sheets (ID: {student_id})")
-        return student_id
-    except Exception as e:
-        print(f"⚠️  Error saving to Google Sheets: {e}")
-        return None
-
-
-# ─────────────────────────────────────────
-# LOCAL DATABASE FUNCTIONS
-# ─────────────────────────────────────────
-
-def load_database() -> list:
-    try:
-        if not os.path.exists(DB_FILE):
-            return []
-        with open(DB_FILE, "r") as f:
-            return json.load(f)
-    except json.JSONDecodeError:
-        print("⚠️  Local database corrupted. Starting fresh.")
-        return []
-    except Exception as e:
-        print(f"⚠️  Error loading local database: {e}")
-        return []
-
-
-def save_database(data: list):
-    try:
-        with open(DB_FILE, "w") as f:
-            json.dump(data, f, indent=4)
-    except Exception as e:
-        print(f"⚠️  Error saving to local database: {e}")
-
-
-def check_existing_student_local(phone: str) -> list | None:
-    try:
-        students = load_database()
-        formatted_phone = f"+65{phone}" if not phone.startswith("+") else phone
-        matches = []
-        for student in students:
-            stored_phone = student.get("phone", "")
-            stored_formatted = f"+65{stored_phone}" if not stored_phone.startswith("+") else stored_phone
-            if stored_formatted == formatted_phone or stored_phone == phone:
-                matches.append(student)
-        return matches if matches else None
-    except Exception as e:
-        print(f"⚠️  Error checking local database: {e}")
-        return None
-
-
-def find_student_locally(identifier_type: str, value: str) -> dict | None:
-    try:
-        students = load_database()
-        value_lower = value.lower()
-        for student in students:
-            if identifier_type == "NAME":
-                if student.get("name", "").lower() == value_lower:
-                    return student
-            elif identifier_type == "ID":
-                if str(student.get("student_id", "")) == str(value):
-                    return student
-        return None
-    except Exception as e:
-        print(f"⚠️  Error searching local database: {e}")
-        return None
-
-
-def save_student_local(name, level, gender, phone, student_id):
-    try:
-        students = load_database()
-        students.append({
-            "student_id": student_id,
-            "name": name,
-            "primary_level": level,
-            "gender": gender,
-            "phone": phone,
-            "joined_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        })
-        save_database(students)
-    except Exception as e:
-        print(f"⚠️  Error saving student locally: {e}")
-
-
-# ─────────────────────────────────────────
-# TOPICS & SUBTOPICS API
-# ─────────────────────────────────────────
-
-def get_topics(level: str, subject: str) -> list | None:
-    print(f"📚 Fetching topics for {subject} {level}...")
-
-    subject_map = {
-        "Math": "Mathematics",
-        "Science": "Science",
-        "English": "English"
-    }
-    api_subject = subject_map.get(subject, subject)
-
-    raw_id = session.get("student_id", "")
-    try:
-        student_id = int(raw_id)
-    except (ValueError, TypeError):
-        print(f"⚠️  Student not on platform (local ID: {raw_id}). Cannot fetch topics.")
-        print("💡 Please register this student on the platform first.")
-        return None
-
-    try:
-        payload = {
-            "student_id": student_id,
-            "subject": api_subject
-        }
-        print(f"📦 Sending payload: {payload}")
-
-        response = requests.post(
-            "https://latam.whatsprep.com/api/topics",
-            headers=registry.headers,
-            json=payload,
-            timeout=10
+# ---------------------------------------------------------------- sending
+async def send_message(to: str, text: str):
+    async with httpx.AsyncClient(timeout=15) as http:
+        r = await http.post(
+            GRAPH_URL,
+            headers={
+                "Authorization": f"Bearer {ACCESS_TOKEN}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "messaging_product": "whatsapp",
+                "to": to,
+                "type": "text",
+                "text": {"body": text},
+            },
         )
-        print(f"📡 Status: {response.status_code}")
-        print(f"📡 Response: {response.text}")
-
-        if response.status_code == 200:
-            data = response.json()
-            topics = data.get("data", [])
-            if not topics:
-                print("⚠️  API returned empty topics list.")
-            return topics if topics else None
-        else:
-            print(f"⚠️  Could not fetch topics: {response.status_code}")
-            return None
-    except Exception as e:
-        print(f"⚠️  Error fetching topics: {e}")
-        return None
+        if r.status_code != 200:
+            print("Send failed:", r.status_code, r.text)
 
 
-def get_subtopics(topic_id: str) -> list | None:
-    print(f"📚 Fetching subtopics for topic {topic_id}...")
-
-    raw_id = session.get("student_id", "")
-    try:
-        student_id = int(raw_id)
-    except (ValueError, TypeError):
-        print(f"⚠️  Student not on platform. Cannot fetch subtopics.")
-        return None
-
-    try:
-        payload = {
-            "student_id": student_id,
-            "topic_id": int(topic_id)
-        }
-        print(f"📦 Sending payload: {payload}")
-
-        response = requests.post(
-            "https://latam.whatsprep.com/api/topics",
-            headers=registry.headers,
-            json=payload,
-            timeout=10
-        )
-        print(f"📡 Status: {response.status_code}")
-        print(f"📡 Response: {response.text}")
-
-        if response.status_code == 200:
-            data = response.json()
-            subtopics = data.get("data", [])
-            if not subtopics:
-                print("⚠️  API returned empty subtopics list.")
-            return subtopics if subtopics else None
-        else:
-            print(f"⚠️  Could not fetch subtopics: {response.status_code}")
-            return None
-    except Exception as e:
-        print(f"⚠️  Error fetching subtopics: {e}")
-        return None
-
-
-def generate_worksheet_url(topic_id: str, level: str, subject: str,
-                           difficulty: str, student_id: str = "") -> str | None:
-    """Generate an assessment using /generate-assessment.
-    Note: level and subject are no longer needed — derived from topic_id and student_id."""
-    print(f"⏳ Generating worksheet...")
-
-    raw_id = session.get("student_id", "")
-    try:
-        student_id_int = int(raw_id)
-    except (ValueError, TypeError):
-        print(f"⚠️  Student not on platform (local ID: {raw_id}). Cannot generate assessment.")
-        return None
-
-    try:
-        topic_id_int = int(topic_id)
-    except (ValueError, TypeError):
-        print(f"⚠️  Invalid topic_id: {topic_id}. Cannot generate assessment with multiple topics.")
-        return None
-
-    try:
-        payload = {
-            "topic_id": topic_id_int,
-            "student_id": student_id_int,
-            "difficulty": difficulty
-        }
-        print(f"📦 Sending payload: {payload}")
-
-        response = requests.post(
-            "https://latam.whatsprep.com/api/generate-assessment",
-            headers=registry.headers,
-            json=payload,
-            timeout=10
-        )
-        print(f"📡 Status: {response.status_code}")
-        print(f"📡 Response: {response.text}")
-
-        if response.status_code == 200:
-            data = response.json()
-            response_data = data.get("data", {})
-            print(f"🔑 Available keys in response_data: {list(response_data.keys())}")
-
-            url = (
-                response_data.get("assessment_url")
-                or response_data.get("assessment_ur")
-                or response_data.get("url")
-            )
-
-            if not url:
-                print("⚠️  No URL returned in response.")
-            return url
-        else:
-            print(f"⚠️  Could not generate assessment: {response.status_code}")
-            return None
-    except Exception as e:
-        print(f"⚠️  Error generating assessment: {e}")
-        return None
-# ─────────────────────────────────────────
-# HELPER FUNCTIONS
-# ─────────────────────────────────────────
-
+# ---------------------------------------------------------------- llm helpers
 def call_llm(messages: list, max_tokens: int = 50) -> str:
     try:
-        response = client.chat.completions.create(
-            model="gpt-4o-mini",
-            max_tokens=max_tokens,
-            messages=messages
+        resp = client.chat.completions.create(
+            model="gpt-4o-mini", max_tokens=max_tokens, messages=messages
         )
-        return response.choices[0].message.content.strip()
+        return resp.choices[0].message.content.strip()
     except Exception as e:
-        print(f"⚠️  Error communicating with AI: {e}")
+        print(f"LLM error: {e}")
         return ""
 
 
-def safe_input(prompt: str) -> str:
-    user_input = input(prompt).strip()
+def wants_to_exit(text: str) -> bool:
+    r = call_llm([{"role": "user", "content": f"""Does this message CLEARLY mean the person wants to leave, quit, or end the conversation?
 
-    wants_to_exit = call_llm([{
-        "role": "user",
-        "content": f"""Does this message CLEARLY mean the person wants to leave, quit, or stop?
+Message: "{text}"
 
-Message: "{user_input}"
-
-Rules:
-- Only return "yes" if the message is unambiguously about leaving/quitting/stopping.
-- If the message looks like a typo, partial word, or could be an attempt at answering the question, return "no".
-- If you are unsure or it's ambiguous, return "no" — when in doubt, do NOT treat it as an exit.
-- Single short words that aren't clearly exit-related (e.g. "mat", "yes", "ok", "1", "Primary 4") are "no".
-
-Examples:
-"exit" -> yes
-"quit" -> yes
-"bye" -> yes
-"leave" -> yes
-"goodbye" -> yes
-"i want to stop" -> yes
-"no thanks" -> yes
-"i'm done" -> yes
-"mat" -> no
-"math" -> no
-"hi" -> no
-"yes" -> no
-"ok" -> no
-"1" -> no
-"Primary 4" -> no
-
-Answer with only "yes" or "no"."""
-    }], max_tokens=5)
-
-    if wants_to_exit and wants_to_exit.lower() == "yes":
-        name = session.get("name", "")
-        if name:
-            print(f"\n👋 Thank you for using Whatsprep, {name}! Goodbye!")
-        else:
-            print("\n👋 Goodbye! Come back anytime.")
-        exit()
-
-    return user_input
+Return ONLY "yes" or "no".
+- Only "yes" if unambiguously about leaving (exit, quit, bye, stop, no thanks, i'm done)
+- Typos or partial words that could be answers (e.g. "mat" for "math") return "no"
+- When unsure, return "no"
+"""}], max_tokens=5)
+    return r.lower() == "yes"
 
 
-# --- Yes/No parsing: cheap local check first, LLM only when unclear ---
+def check_if_done(text: str) -> bool:
+    r = call_llm([{"role": "user", "content": f"""Does this message mean the person wants to stop, end, or has nothing more to ask?
 
-YES = {"yes","y","yup","yeah","yea","ya","yep","yah","sure","ok","okay","okok",
-       "correct","right","true","confirm","confirmed","that's right","thats right",
-       "yes please","correct la","can","👍","✅"}
+Message: "{text}"
 
-NO  = {"no","n","nope","nah","naw","not","wrong","incorrect","false",
-       "not really","no lah","cannot","❌"}
-
-
-def parse_yes_no(text: str):
-    """Fast local check. Returns True / False / None (unclear)."""
-    if not text:
-        return None
-    t = text.strip().lower().strip(".!,?")
-    if t in YES:
-        return True
-    if t in NO:
-        return False
-    return None
+Return ONLY "yes" or "no".
+- "no" on its own means YES they are done
+- Only return "no" if they are clearly asking for math or a topic
+"""}], max_tokens=5)
+    return r.lower() == "yes"
 
 
-def ai_yes_no(text: str):
-    """LLM fallback for phrasing the local check missed."""
-    result = call_llm([
-        {"role": "system", "content":
-         "You classify a parent's reply to a yes/no question. "
-         "Reply with exactly one word: YES, NO, or UNCLEAR. "
-         "Treat affirmations ('that's right', 'she is', 'correct') as YES "
-         "and denials ('not quite', 'wrong one') as NO."},
-        {"role": "user", "content": text},
-    ], max_tokens=5)
-    a = (result or "").strip().upper()
-    return True if a == "YES" else False if a == "NO" else None
+def validate_name(text: str) -> str:
+    r = call_llm([{"role": "user", "content": f"""Extract only the child's name from: "{text}"
+Return ONLY the name, properly capitalised. If none, return "Unknown"."""}])
+    if not r or r == "Unknown" or not re.match(r"^[A-Za-z]+(?: [A-Za-z]+)*$", r):
+        return "Unknown"
+    return r
 
 
-def ask_yes_no(prompt: str) -> bool:
-    """Ask a yes/no question until we get a clear answer."""
-    while True:
-        raw = safe_input(prompt)
-        ans = parse_yes_no(raw)
-        if ans is None:
-            ans = ai_yes_no(raw)
-        if ans is not None:
-            return ans
-        print("Sorry, I didn't quite catch that — is that a yes or a no?")
-    if wants_to_exit and wants_to_exit.lower() == "yes":
-        name = session.get("name", "")
-        if name:
-            print(f"\n👋 Thank you for using Whatsprep, {name}! Goodbye!")
-        else:
-            print("\n👋 Goodbye! Come back anytime.")
-        exit()
-
-    return user_input
-
-def ask_with_retries(prompt: str, validate_fn, error_msg: str, max_tries=3) -> str:
-    for attempt in range(max_tries):
-        user_input = safe_input(prompt)
-        result = validate_fn(user_input)
-        if result != "Unknown":
-            return result
-        remaining = max_tries - attempt - 1
-        if remaining > 0:
-            print(f"⚠️  {error_msg} ({remaining} tries left)")
-        else:
-            print("\n😔 Having trouble? Please contact us at support@whatsprep.com")
-            exit()
+def validate_level(text: str) -> str:
+    r = call_llm([{"role": "user", "content": f"""Extract the primary school level from: "{text}"
+Return ONLY "Primary 1" through "Primary 6", or "Unknown".
+"p5" -> Primary 5 | "primary 3" -> Primary 3 | "grade 4" -> Unknown"""}])
+    return r if r in LEVELS else "Unknown"
 
 
-def pick_student(students: list) -> dict | None:
-    if len(students) == 1:
-        return students[0]
-    print(f"\n👨‍👩‍👧‍👦 We found {len(students)} children under this number:")
-    for i, s in enumerate(students, 1):
-        level = s.get("primary_level") or "Unknown level"
-        print(f"  {i}. {s['name']} — {level}")
-    while True:
-        try:
-            choice = safe_input("\nWhich child is this for? Enter the number: ")
-            index = int(choice) - 1
-            if 0 <= index < len(students):
-                return students[index]
-            print(f"⚠️  Please enter a number between 1 and {len(students)}.")
-        except ValueError:
-            print("⚠️  Please enter a number.")
+def validate_gender(text: str) -> str:
+    r = call_llm([{"role": "user", "content": f"""Extract gender from: "{text}"
+Return ONLY "Male", "Female", or "Unknown".
+"boy" -> Male | "my daughter" -> Female | "idk" -> Unknown"""}])
+    return r if r in ["Male", "Female"] else "Unknown"
+
+
+def validate_subject(text: str) -> str:
+    r = call_llm([{"role": "user", "content": f"""Does this message indicate the person wants Math practice questions?
+
+Message: "{text}"
+
+Return ONLY "Math" if yes, or "Unknown" if no."""}])
+    return "Math" if r == "Math" else "Unknown"
+
+
+def validate_difficulty(text: str) -> str:
+    r = call_llm([{"role": "user", "content": f"""Extract difficulty from: "{text}"
+Return ONLY "Easy", "Medium", or "Hard". If unclear, "Medium"."""}])
+    return r if r in ["Easy", "Medium", "Hard"] else "Medium"
 
 
 def extract_student_identifier(text: str) -> tuple:
-    result = call_llm([{
-        "role": "user",
-        "content": f"""Extract either a student name or student ID from this message: "{text}"
-
-Rules:
-- If you find a student ID (starts with S followed by numbers e.g. S0012, or a plain number like 15), return: ID|<the_id>
-- If you find a child's name, return: NAME|<the_name>
-- If neither found, return: UNKNOWN|UNKNOWN
-
-Examples:
-"hi i want math MCQ for my child Ayushi" → NAME|Ayushi
-"i want math for S0012" → ID|S0012
-"give me math questions for student id 15" → ID|15
-"hi" → UNKNOWN|UNKNOWN"""
-    }], max_tokens=20)
+    r = call_llm([{"role": "user", "content": f"""Extract either a student name or student ID from: "{text}"
+- Student ID (S0012, or plain number like 15): return ID|<id>
+- Child's name: return NAME|<name>
+- Neither: return UNKNOWN|UNKNOWN"""}], max_tokens=20)
     try:
-        kind, value = result.strip().split("|", 1)
+        kind, value = r.strip().split("|", 1)
         return kind.strip().upper(), value.strip()
     except Exception:
         return "UNKNOWN", "UNKNOWN"
 
 
-# ─────────────────────────────────────────
-# VALIDATION FUNCTIONS
-# ─────────────────────────────────────────
-
-def validate_name(text: str) -> str:
-    result = call_llm([{
-        "role": "user",
-        "content": f"""Extract only the child's name from this input: "{text}"
-Rules:
-- Return ONLY the name, properly capitalised
-- If no valid name found, return "Unknown"
-- No extra words or punctuation
-
-Examples:
-"his name is john" → John
-"she is ayushi" → Ayushi
-"abc123" → Unknown"""
-    }])
-    if not result or result == "Unknown" or not re.match(r"^[A-Za-z]+(?: [A-Za-z]+)*$", result):
-        return "Unknown"
-    return result
-
-
-def validate_level(text: str) -> str:
-    result = call_llm([{
-        "role": "user",
-        "content": f"""Extract the primary school level from: "{text}"
-Rules:
-- Return ONLY "Primary 1", "Primary 2", "Primary 3", "Primary 4", "Primary 5", or "Primary 6"
-- If unclear, return "Unknown"
-
-Examples:
-"p5" → Primary 5
-"primary 3" → Primary 3
-"grade 4" → Unknown"""
-    }])
-    if not result or result not in ["Primary 1", "Primary 2", "Primary 3",
-                                     "Primary 4", "Primary 5", "Primary 6"]:
-        return "Unknown"
-    return result
-
-
-def validate_gender(text: str) -> str:
-    result = call_llm([{
-        "role": "user",
-        "content": f"""Extract gender from: "{text}"
-Rules:
-- Return ONLY "Male", "Female", or "Unknown"
-
-Examples:
-"boy" → Male
-"she" → Female
-"my daughter" → Female
-"idk" → Unknown"""
-    }])
-    if not result or result not in ["Male", "Female"]:
-        return "Unknown"
-    return result
-
-
-def validate_phone(text: str) -> str:
+# ---------------------------------------------------------------- local db
+def load_database() -> list:
     try:
-        cleaned = re.sub(r"[\s\-\(\)\+]", "", text)
-        if len(cleaned) > 8 and cleaned.startswith("65"):
-            cleaned = cleaned[2:]
-        if re.match(r"^\d{6,15}$", cleaned):
-            return cleaned
-        return "Unknown"
+        if not os.path.exists(DB_FILE):
+            return []
+        with open(DB_FILE) as f:
+            return json.load(f)
     except Exception:
-        return "Unknown"
+        return []
 
 
-def validate_subject(text: str) -> str:
-    result = call_llm([{
-        "role": "user",
-        "content": f"""Does this message indicate the person wants Math or Mathematics practice questions?
-
-Message: "{text}"
-
-Return ONLY "Math" if yes, or "Unknown" if no.
-
-Examples:
-"math" → Math
-"mathematics" → Math
-"i want math questions" → Math
-"math mcq" → Math
-"maths please" → Math
-"science" → Unknown
-"english" → Unknown
-"hi" → Unknown"""
-    }])
-    if not result or result not in ["Math"]:
-        return "Unknown"
-    return result
+def save_student_local(name, level, gender, phone, student_id):
+    students = load_database()
+    students.append({
+        "student_id": student_id, "name": name, "primary_level": level,
+        "gender": gender, "phone": phone,
+        "joined_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+    })
+    with open(DB_FILE, "w") as f:
+        json.dump(students, f, indent=4)
 
 
-def validate_difficulty(text: str) -> str:
-    result = call_llm([{
-        "role": "user",
-        "content": f"""Extract difficulty level from: "{text}"
-Rules:
-- Return ONLY "Easy", "Medium", or "Hard"
-- If unclear default to "Medium"
-
-Examples:
-"easy" → Easy
-"hard questions" → Hard
-"normal" → Medium
-"medium" → Medium"""
-    }])
-    if not result or result not in ["Easy", "Medium", "Hard"]:
-        return "Medium"
-    return result
+def check_existing_student_local(phone: str) -> list | None:
+    matches = [s for s in load_database() if s.get("phone", "").lstrip("+65") == phone]
+    return matches or None
 
 
-# ─────────────────────────────────────────
-# REGISTRATION FLOW
-# ─────────────────────────────────────────
-
-def confirm_details(name, level, gender, phone) -> bool:
-    print("\n📋 Please confirm your child's details:")
-    print(f"   👦 Name:   {name}")
-    print(f"   🎓 Level:  {level}")
-    print(f"   👤 Gender: {gender}")
-    print(f"   📱 Phone:  {phone}")
-    return ask_yes_no("\nIs this correct? ")
-    while True:
-        try:
-            confirm = safe_input("\nIs this correct? (yes/no): ").lower()
-            if confirm in ["yes", "y"]:
-                return True
-            elif confirm in ["no", "n"]:
-                return False
-            else:
-                print("⚠️  Please type 'yes' or 'no'.")
-        except Exception as e:
-            print(f"⚠️  Unexpected error: {e}. Please try again.")
+def find_student_locally(kind: str, value: str) -> dict | None:
+    for s in load_database():
+        if kind == "NAME" and s.get("name", "").lower() == value.lower():
+            return s
+        if kind == "ID" and str(s.get("student_id", "")) == str(value):
+            return s
+    return None
 
 
-def greet_and_register():
-    global session, students_sheet
+# ---------------------------------------------------------------- platform api
+def get_topics(student_id, subject: str) -> list | None:
+    try:
+        sid = int(student_id)
+    except (ValueError, TypeError):
+        print(f"Student not on platform: {student_id}")
+        return None
 
-    print("Hi! Welcome to Whatsprep 👋")
-    print("-" * 30)
-    print("(You can type 'exit' at any time to quit)\n")
-
-    students_sheet = get_sheets()
-
-    # --- Grab their opening message ---
-    opener = safe_input("You: ")
-
-    # --- Try to extract name or student ID from opener ---
-    identifier_type, identifier_value = extract_student_identifier(opener)
-
-    if identifier_type in ["NAME", "ID"]:
-        student = find_student_locally(identifier_type, identifier_value)
-        if student:
-            level_display = student.get("primary_level") or "Unknown level"
-            if ask_yes_no(f"\nIs your child {student['name']} in {level_display}? "):
-            
-                session = {
-                    "name": student["name"],
-                    "level": student.get("primary_level", ""),
-                    "gender": student.get("gender", ""),
-                    "phone": student.get("phone", ""),
-                    "student_id": student.get("student_id", "")
-                }
-                print(f"\n✅ Great! Let's get started, {session['name']}!")
-                handle_menu()
-                return
-            else:
-                print("\n🤔 No problem, let's verify via your phone number instead.")
-        else:
-            print("\n🤔 Couldn't find that student locally. Let's verify via phone.")
-
-    # --- Phone lookup ---
-    phone = ask_with_retries(
-        "What is your WhatsApp number? ",
-        validate_phone,
-        "That doesn't look like a valid phone number. Please enter e.g. 81823031"
-    )
-
-    students_found = registry.check_student_exists(phone)
-    if not students_found:
-        students_found = check_existing_student_local(phone)
-
-    if students_found:
-        existing = pick_student(students_found)
-        level_display = existing.get("primary_level") or "Unknown level"
-
-        if ask_yes_no(f"\nIs your child {existing['name']} in {level_display}? "):
-            session = {
-                "name": existing["name"],
-                "level": existing.get("primary_level", ""),
-                "gender": existing.get("gender") or "",
-                "phone": phone,
-                "student_id": existing.get("student_id", "")
-            }
-            print(f"\n✅ Welcome back, {session['name']}!")
-            handle_menu()
-            return
-        else:
-            print("\n🤔 Let's register a new student under this number.")
-
-    # --- New student registration ---
-    name = ask_with_retries(
-        "What is the student's name? ",
-        validate_name,
-        "I couldn't catch a valid name. Please write just the name e.g. 'Ayushi'."
-    )
-    level = ask_with_retries(
-        "What is their schooling level? (e.g. P1, P2 ... P6): ",
-        validate_level,
-        "Please enter a level between Primary 1 and Primary 6 e.g. 'P4' or 'Primary 4'."
-    )
-    gender = ask_with_retries(
-        "What is their gender? (e.g. boy, girl, he, she): ",
-        validate_gender,
-        "Please enter something like 'boy', 'girl', 'he', or 'she'."
-    )
-
-    while True:
-        if confirm_details(name, level, gender, phone):
-            break
-        else:
-            print("\n🔄 Which field would you like to fix?")
-            print("   1. Name\n   2. Level\n   3. Gender\n   4. Phone")
-            while True:
-                field = safe_input("Enter the number (1-4): ")
-                if field in ["1", "2", "3", "4"]:
-                    break
-                print("⚠️  Please enter a number between 1 and 4.")
-            if field == "1":
-                name = ask_with_retries("New name: ", validate_name,
-                                        "I couldn't catch a valid name.")
-            elif field == "2":
-                level = ask_with_retries("New level (e.g. P3): ", validate_level,
-                                         "Please enter Primary 1 to Primary 6.")
-            elif field == "3":
-                gender = ask_with_retries("New gender (boy/girl): ", validate_gender,
-                                          "Please enter boy or girl.")
-            elif field == "4":
-                phone = ask_with_retries("New phone number: ", validate_phone,
-                                         "That doesn't look like a valid phone number.")
-
-    new_student = registry.register_student(name, level, gender, phone)
-    student_id = (
-        new_student.get("student_id", f"S{datetime.now().strftime('%Y%m%d%H%M%S')}")
-        if new_student
-        else f"S{datetime.now().strftime('%Y%m%d%H%M%S')}"
-    )
-
-    if students_sheet:
-        save_student_to_sheets(students_sheet, name, level, gender, phone)
-
-    save_student_local(name, level, gender, phone, student_id)
-
-    session = {
-        "name": name,
-        "level": level,
-        "gender": gender,
-        "phone": phone,
-        "student_id": student_id
-    }
-
-    print("-" * 30)
-    print(f"✅ {name} has been successfully registered in Whatsprep!")
-    print(f"   🆔 Student ID: {student_id}")
-    handle_menu()
-
-
-# ─────────────────────────────────────────
-# MAIN MENU — SUBJECT → TOPICS → SUBTOPICS → DIFFICULTY → GENERATE
-# ─────────────────────────────────────────
-
-def check_if_done(text: str) -> bool:
-    result = call_llm([{
-        "role": "user",
-        "content": f"""Does this message mean the person wants to stop, end, or has nothing more to ask?
-
-Message: "{text}"
-
-Return ONLY "yes" or "no".
-
-Rules:
-- "no" on its own means YES they are done
-- Only return "no" if they are clearly asking for math or a topic
-- When in doubt about short replies like "no", "nope", "nothing", return "yes"
-
-Examples:
-"done" → yes
-"bye" → yes
-"no" → yes
-"nope" → yes
-"nothing else" → yes
-"no thanks" → yes
-"math mcq" → no
-"math" → no
-"yes please give me more" → no"""
-    }])
-    if not result:
-        return False
-    return result.lower() == "yes"
-
-
-def ask_subject() -> str:
-    print(f"\nWhat would you like practice questions for?")
-    print("  We currently offer: Math")
-    while True:
-        user_input = safe_input("\nYou: ")
-        if check_if_done(user_input):
-            print(f"\n👋 Thank you for using Whatsprep, {session['name']}! Goodbye!")
-            exit()
-        subject = validate_subject(user_input)
-        if subject != "Unknown":
-            return subject
-        print("⚠️  We currently only offer Math questions. Please type 'Math' to continue.")
-
-
-def ask_topic(subject: str) -> tuple:
-    topics = get_topics(session["level"], subject)
-    if not topics:
-        print(f"\n⚠️  Could not load topics. Please try again later.")
-        return None, None
-
-    print(f"\n📚 For {subject}, here are the available topics for {session['name']}:")
-    for i, topic in enumerate(topics, 1):
-        print(f"  {i}. {topic.get('topic_name', f'Topic {i}')}")
-
-    print("\nYou can select one or multiple topics e.g. '1' or '1,2,3' or '1 2 3'")
-
-    while True:
-        try:
-            choice = safe_input("\nEnter the topic number(s): ")
-
-            raw_choices = re.split(r"[,\s]+", choice.strip())
-            indices = []
-            valid = True
-
-            for c in raw_choices:
-                if not c:
-                    continue
-                try:
-                    index = int(c) - 1
-                    if 0 <= index < len(topics):
-                        indices.append(index)
-                    else:
-                        print(f"⚠️  '{c}' is out of range. Please enter numbers between 1 and {len(topics)}.")
-                        valid = False
-                        break
-                except ValueError:
-                    print(f"⚠️  '{c}' is not a valid number.")
-                    valid = False
-                    break
-
-            if not valid or not indices:
-                continue
-
-            # Remove duplicates while preserving order
-            seen = set()
-            indices = [i for i in indices if not (i in seen or seen.add(i))]
-
-            selected_topics = [topics[i] for i in indices]
-            topic_ids = [str(t.get("topic_id", "")) for t in selected_topics]
-            topic_names = [t.get("topic_name", "") for t in selected_topics]
-
-            print(f"\n✅ Selected topic(s):")
-            for name in topic_names:
-                print(f"   • {name}")
-
-            return ",".join(topic_ids), ", ".join(topic_names)
-
-        except ValueError:
-            print("⚠️  Please enter valid numbers.")
-
-
-def ask_subtopic(topic_id: str, topic_name: str) -> tuple:
-    # Skip subtopic selection if multiple topics selected
-    if "," in str(topic_id):
-        print("📝 Multiple topics selected — using broad topics.")
-        return None, None
-
-    while True:
-        choice = safe_input(
-            f"\nWould you like to choose a specific subtopic under '{topic_name}', "
-            f"or use the broad topic?\n"
-            f"  1. Show me subtopics\n"
-            f"  2. Use the broad topic\n"
-            f"Enter (1/2): "
+    subject_map = {"Math": "Mathematics", "Science": "Science", "English": "English"}
+    try:
+        r = requests.post(
+            "https://latam.whatsprep.com/api/topics",
+            headers=registry.headers,
+            json={"student_id": sid, "subject": subject_map.get(subject, subject)},
+            timeout=10,
         )
-        if choice in ["1", "2"]:
-            break
-        print("⚠️  Please enter 1 or 2.")
+        if r.status_code == 200:
+            return r.json().get("data") or None
+        print(f"Topics failed: {r.status_code} {r.text}")
+    except Exception as e:
+        print(f"Topics error: {e}")
+    return None
 
-    if choice == "2":
-        return None, None
 
-    subtopics = get_subtopics(topic_id)
-    if not subtopics:
-        print("⚠️  Could not load subtopics. Using broad topic instead.")
-        return None, None
+def get_subtopics(student_id, topic_id: str) -> list | None:
+    try:
+        sid, tid = int(student_id), int(topic_id)
+    except (ValueError, TypeError):
+        return None
+    try:
+        r = requests.post(
+            "https://latam.whatsprep.com/api/topics",
+            headers=registry.headers,
+            json={"student_id": sid, "topic_id": tid},
+            timeout=10,
+        )
+        if r.status_code == 200:
+            return r.json().get("data") or None
+    except Exception as e:
+        print(f"Subtopics error: {e}")
+    return None
 
-    print(f"\n📖 Subtopics under '{topic_name}':")
-    for i, sub in enumerate(subtopics, 1):
-        print(f"  {i}. {sub.get('subtopic_name', sub.get('name', f'Subtopic {i}'))}")
 
-    while True:
+def generate_worksheet_url(student_id, topic_id: str, difficulty: str) -> str | None:
+    try:
+        sid, tid = int(student_id), int(topic_id)
+    except (ValueError, TypeError):
+        return None
+    try:
+        r = requests.post(
+            "https://latam.whatsprep.com/api/generate-assessment",
+            headers=registry.headers,
+            json={"topic_id": tid, "student_id": sid, "difficulty": difficulty},
+            timeout=30,
+        )
+        if r.status_code == 200:
+            d = r.json().get("data", {})
+            return d.get("assessment_url") or d.get("assessment_ur") or d.get("url")
+        print(f"Generate failed: {r.status_code} {r.text}")
+    except Exception as e:
+        print(f"Generate error: {e}")
+    return None
+
+
+# ---------------------------------------------------------------- flow
+def session_for(phone: str) -> dict:
+    if phone not in SESSIONS:
+        SESSIONS[phone] = {"step": "start", "data": {}}
+    return SESSIONS[phone]
+
+
+def format_topics(topics: list) -> str:
+    lines = [f"{i}. {t.get('topic_name', f'Topic {i}')}" for i, t in enumerate(topics, 1)]
+    return "\n".join(lines)
+
+
+def menu_prompt(name: str) -> str:
+    return (f"How can I help you today, {name}?\n\n"
+            f"Tell me what you'd like, e.g. \"I want Math questions\".")
+
+
+def start_registration(s: dict) -> str:
+    s["step"] = "reg_name"
+    return "Let's register a new student.\n\nWhat is the student's name?"
+
+
+def confirm_details_text(d: dict) -> str:
+    return (f"Please confirm your child's details:\n\n"
+            f"Name: {d['name']}\n"
+            f"Level: {d['level']}\n"
+            f"Gender: {d['gender']}\n"
+            f"Phone: {d['phone']}\n\n"
+            f"Is this correct? (yes/no)")
+
+
+def do_register(s: dict) -> str:
+    d = s["data"]
+    new = registry.register_student(d["name"], d["level"], d["gender"], d["phone"])
+    student_id = (new or {}).get(
+        "student_id", f"S{datetime.now().strftime('%Y%m%d%H%M%S')}"
+    )
+    save_student_local(d["name"], d["level"], d["gender"], d["phone"], student_id)
+    d["student_id"] = student_id
+    s["step"] = "menu"
+    return (f"{d['name']} has been registered with WhatsPrep.\n"
+            f"Student ID: {student_id}\n\n{menu_prompt(d['name'])}")
+
+
+def load_and_show_topics(s: dict) -> str:
+    d = s["data"]
+    topics = get_topics(d.get("student_id"), d["subject"])
+    if not topics:
+        s["step"] = "menu"
+        return "Sorry, I couldn't load the topics right now. Please try again shortly."
+    d["topics"] = topics
+    s["step"] = "topic"
+    return (f"Here are the available topics for {d['name']}:\n\n"
+            f"{format_topics(topics)}\n\n"
+            f"Reply with the number(s), e.g. \"1\" or \"1,2,3\".")
+
+
+def handle(phone: str, text: str) -> str:
+    """One inbound message in, one reply out."""
+    s = session_for(phone)
+    d = s["data"]
+    step = s["step"]
+
+    # Global exit, valid at any step
+    if step not in ("reg_name",) and wants_to_exit(text):
+        name = d.get("name", "")
+        SESSIONS.pop(phone, None)
+        return f"Thank you for using WhatsPrep{', ' + name if name else ''}. Goodbye!"
+
+    # ---------- start: identify the parent by their WhatsApp number
+    if step == "start":
+        local_phone = phone[2:] if phone.startswith("65") else phone
+        d["phone"] = local_phone
+
+        kind, value = extract_student_identifier(text)
+        if kind in ("NAME", "ID"):
+            student = find_student_locally(kind, value)
+            if student:
+                d["candidate"] = student
+                s["step"] = "confirm_student"
+                lvl = student.get("primary_level") or "Unknown level"
+                return f"Is your child {student['name']} in {lvl}? (yes/no)"
+
+        found = registry.check_student_exists(local_phone) \
+            or check_existing_student_local(local_phone)
+
+        if found and len(found) == 1:
+            d["candidate"] = found[0]
+            s["step"] = "confirm_student"
+            lvl = found[0].get("primary_level") or "Unknown level"
+            return (f"Welcome back to WhatsPrep!\n\n"
+                    f"Is your child {found[0]['name']} in {lvl}? (yes/no)")
+
+        if found and len(found) > 1:
+            d["found"] = found
+            s["step"] = "pick_student"
+            lines = [f"{i}. {c['name']} — {c.get('primary_level') or 'Unknown level'}"
+                     for i, c in enumerate(found, 1)]
+            return ("We found more than one child under this number:\n\n"
+                    + "\n".join(lines) + "\n\nWhich child is this for? Reply with the number.")
+
+        return "Hi! Welcome to WhatsPrep.\n\n" + start_registration(s)
+
+    # ---------- pick between siblings
+    if step == "pick_student":
         try:
-            pick = safe_input("\nEnter the number of the subtopic you want: ")
-            index = int(pick) - 1
-            if 0 <= index < len(subtopics):
-                selected = subtopics[index]
-                sub_id = selected.get("subtopic_id", selected.get("id", ""))
-                sub_name = selected.get("subtopic_name", selected.get("name", ""))
-                return sub_id, sub_name
-            print(f"⚠️  Please enter a number between 1 and {len(subtopics)}.")
-        except ValueError:
-            print("⚠️  Please enter a number.")
+            i = int(text.strip()) - 1
+            chosen = d["found"][i]
+        except (ValueError, IndexError):
+            return f"Please reply with a number between 1 and {len(d['found'])}."
+        d["candidate"] = chosen
+        s["step"] = "confirm_student"
+        lvl = chosen.get("primary_level") or "Unknown level"
+        return f"Is your child {chosen['name']} in {lvl}? (yes/no)"
 
+    # ---------- confirm the matched student
+    if step == "confirm_student":
+        ans = text.strip().lower()
+        if ans in ("yes", "y"):
+            c = d["candidate"]
+            d.update({
+                "name": c["name"],
+                "level": c.get("primary_level", ""),
+                "gender": c.get("gender", ""),
+                "student_id": c.get("student_id", ""),
+            })
+            s["step"] = "menu"
+            return f"Great, let's get started!\n\n{menu_prompt(d['name'])}"
+        if ans in ("no", "n"):
+            return start_registration(s)
+        return "Please reply yes or no."
 
-def ask_difficulty() -> str:
-    print("\nWhat difficulty would you like?")
-    print("  1. Easy")
-    print("  2. Medium")
-    print("  3. Hard")
-    while True:
-        user_input = safe_input("\nYou: ")
-        difficulty = validate_difficulty(user_input)
-        if difficulty:
-            return difficulty
+    # ---------- registration
+    if step == "reg_name":
+        name = validate_name(text)
+        if name == "Unknown":
+            return "I couldn't catch a valid name. Please send just the name, e.g. \"Ayushi\"."
+        d["name"] = name
+        s["step"] = "reg_level"
+        return "What is their schooling level? (e.g. P1 to P6)"
 
+    if step == "reg_level":
+        level = validate_level(text)
+        if level == "Unknown":
+            return "Please send a level between Primary 1 and Primary 6, e.g. \"P4\"."
+        d["level"] = level
+        s["step"] = "reg_gender"
+        return "What is their gender? (boy or girl)"
 
-def handle_menu():
-    print(f"\nHow can I help you today, {session['name']}? 😊")
-    print("-" * 30)
-    print("Tell me what you'd like — e.g. 'I want Math questions' or 'Math mcq please'")
-    print("-" * 30)
+    if step == "reg_gender":
+        gender = validate_gender(text)
+        if gender == "Unknown":
+            return "Please send boy or girl."
+        d["gender"] = gender
+        s["step"] = "confirm_details"
+        return confirm_details_text(d)
 
-    while True:
+    if step == "confirm_details":
+        ans = text.strip().lower()
+        if ans in ("yes", "y"):
+            return do_register(s)
+        if ans in ("no", "n"):
+            s["step"] = "fix_field"
+            return ("Which field would you like to fix?\n\n"
+                    "1. Name\n2. Level\n3. Gender\n\nReply with the number.")
+        return "Please reply yes or no."
+
+    if step == "fix_field":
+        choice = text.strip()
+        mapping = {"1": ("reg_name", "New name:"),
+                   "2": ("reg_level", "New level (e.g. P3):"),
+                   "3": ("reg_gender", "New gender (boy/girl):")}
+        if choice not in mapping:
+            return "Please reply with 1, 2, or 3."
+        s["step"], prompt = mapping[choice]
+        d["returning_to_confirm"] = True
+        return prompt
+
+    # ---------- main menu
+    if step == "menu":
+        if check_if_done(text):
+            name = d.get("name", "")
+            SESSIONS.pop(phone, None)
+            return f"Thank you for using WhatsPrep, {name}. Goodbye!"
+
+        subject = validate_subject(text)
+        if subject == "Unknown":
+            return ("We currently offer Math only.\n\n"
+                    "Reply \"Math\" to see the available topics.")
+        d["subject"] = subject
+        return load_and_show_topics(s)
+
+    # ---------- topic selection
+    if step == "topic":
+        topics = d["topics"]
+        raw = re.split(r"[,\s]+", text.strip())
+        indices, seen = [], set()
+        for c in raw:
+            if not c:
+                continue
+            try:
+                i = int(c) - 1
+            except ValueError:
+                return f"\"{c}\" isn't a number. Please reply with numbers between 1 and {len(topics)}."
+            if not (0 <= i < len(topics)):
+                return f"\"{c}\" is out of range. Please pick between 1 and {len(topics)}."
+            if i not in seen:
+                seen.add(i)
+                indices.append(i)
+
+        if not indices:
+            return "Please reply with a topic number."
+
+        selected = [topics[i] for i in indices]
+        d["topic_ids"] = [str(t.get("topic_id", "")) for t in selected]
+        d["topic_names"] = [t.get("topic_name", "") for t in selected]
+
+        names = "\n".join(f"• {n}" for n in d["topic_names"])
+
+        if len(d["topic_ids"]) > 1:
+            d["subtopic_id"] = None
+            s["step"] = "difficulty"
+            return (f"Selected:\n{names}\n\n"
+                    f"Multiple topics selected, so we'll use the broad topics.\n\n"
+                    f"What difficulty?\n1. Easy\n2. Medium\n3. Hard")
+
+        s["step"] = "subtopic_choice"
+        return (f"Selected:\n{names}\n\n"
+                f"Would you like a specific subtopic, or the broad topic?\n\n"
+                f"1. Show me subtopics\n2. Use the broad topic")
+
+    # ---------- subtopic
+    if step == "subtopic_choice":
+        choice = text.strip()
+        if choice == "2":
+            d["subtopic_id"] = None
+            s["step"] = "difficulty"
+            return "What difficulty?\n1. Easy\n2. Medium\n3. Hard"
+        if choice != "1":
+            return "Please reply with 1 or 2."
+
+        subs = get_subtopics(d.get("student_id"), d["topic_ids"][0])
+        if not subs:
+            d["subtopic_id"] = None
+            s["step"] = "difficulty"
+            return ("Couldn't load subtopics, so we'll use the broad topic.\n\n"
+                    "What difficulty?\n1. Easy\n2. Medium\n3. Hard")
+
+        d["subtopics"] = subs
+        s["step"] = "subtopic_pick"
+        lines = [f"{i}. {sub.get('subtopic_name', sub.get('name', f'Subtopic {i}'))}"
+                 for i, sub in enumerate(subs, 1)]
+        return (f"Subtopics under {d['topic_names'][0]}:\n\n"
+                + "\n".join(lines) + "\n\nReply with the number.")
+
+    if step == "subtopic_pick":
+        subs = d["subtopics"]
         try:
-            user_input = safe_input("\nYou: ")
+            i = int(text.strip()) - 1
+            chosen = subs[i]
+        except (ValueError, IndexError):
+            return f"Please reply with a number between 1 and {len(subs)}."
+        d["subtopic_id"] = chosen.get("subtopic_id", chosen.get("id", ""))
+        d["subtopic_name"] = chosen.get("subtopic_name", chosen.get("name", ""))
+        s["step"] = "difficulty"
+        return (f"Subtopic: {d['subtopic_name']}\n\n"
+                f"What difficulty?\n1. Easy\n2. Medium\n3. Hard")
 
-            if not user_input:
-                print("⚠️  Please type something so I can help you!")
-                continue
+    # ---------- difficulty, then generate
+    if step == "difficulty":
+        mapping = {"1": "Easy", "2": "Medium", "3": "Hard"}
+        difficulty = mapping.get(text.strip()) or validate_difficulty(text)
+        d["difficulty"] = difficulty
 
-            if check_if_done(user_input):
-                print(f"\n👋 Thank you for using Whatsprep, {session['name']}! Goodbye!")
-                exit()
+        ids = [d["subtopic_id"]] if d.get("subtopic_id") else d["topic_ids"]
 
-            # --- Step 1: Subject ---
-            subject = validate_subject(user_input)
-            if subject == "Unknown":
-                subject = ask_subject()
+        urls = []
+        for tid in ids:
+            url = generate_worksheet_url(d.get("student_id"), str(tid).strip(), difficulty)
+            if url:
+                urls.append(url)
 
-            # --- Step 2: Topics ---
-            topic_id, topic_name = ask_topic(subject)
-            if not topic_id:
-                print("\nIs there anything else I can help you with?")
-                continue
+        s["step"] = "menu"
 
-            # --- Step 3: Subtopics (optional) ---
-            subtopic_id, subtopic_name = ask_subtopic(topic_id, topic_name)
-            if subtopic_name:
-                print(f"✅ Subtopic selected: {subtopic_name}")
-            else:
-                print(f"✅ Using broad topic(s): {topic_name}")
+        if not urls:
+            return ("Sorry, worksheet generation failed. Please try again shortly.\n\n"
+                    "Anything else I can help with?")
 
-            # --- Step 4: Difficulty ---
-            difficulty = ask_difficulty()
-            print(f"✅ Difficulty: {difficulty}")
+        if len(urls) == 1:
+            return (f"Your worksheet is ready.\n\n{urls[0]}\n\n"
+                    f"Anything else I can help with?")
 
-            # --- Step 5: Generate assessment(s) ---
-            final_topic_id = subtopic_id if subtopic_id else topic_id
+        lines = "\n".join(f"Worksheet {i}: {u}" for i, u in enumerate(urls, 1))
+        return f"Your worksheets are ready.\n\n{lines}\n\nAnything else I can help with?"
 
-            print(f"\n⏳ Generating your worksheet now...")
-            print(f"   📚 Subject:    {subject}")
-            print(f"   📝 Topic(s):   {topic_name}")
-            if subtopic_name:
-                print(f"   🔖 Subtopic:   {subtopic_name}")
-            print(f"   ⚡ Difficulty: {difficulty}")
-            print(f"   🎓 Level:      {session['level']}")
+    # ---------- fallback
+    s["step"] = "menu"
+    return menu_prompt(d.get("name", "there"))
 
-            # generate-assessment only accepts ONE topic_id — handle multi-topic selection
-            topic_id_list = str(final_topic_id).split(",")
 
-            if len(topic_id_list) > 1:
-                print(f"\n⏳ Generating {len(topic_id_list)} assessments (one per topic)...")
-                urls = []
-                for single_topic_id in topic_id_list:
-                    url = generate_worksheet_url(
-                        topic_id=single_topic_id.strip(),
-                        level=session["level"],
-                        subject=subject,
-                        difficulty=difficulty,
-                        student_id=str(session.get("student_id", ""))
-                    )
-                    if url:
-                        urls.append(url)
+# ---------------------------------------------------------------- webhook
+@app.get("/")
+async def verify(request: Request):
+    p = request.query_params
+    if p.get("hub.mode") == "subscribe" and p.get("hub.verify_token") == VERIFY_TOKEN:
+        return Response(content=p.get("hub.challenge"), media_type="text/plain")
+    return Response(status_code=403)
 
-                if urls:
-                    print(f"\n✅ Your worksheets are ready!")
-                    for i, u in enumerate(urls, 1):
-                        print(f"   🔗 Worksheet {i}: {u}")
-                else:
-                    print("\n🚧 Worksheet generation coming soon!")
-            else:
-                url = generate_worksheet_url(
-                    topic_id=topic_id_list[0].strip(),
-                    level=session["level"],
-                    subject=subject,
-                    difficulty=difficulty,
-                    student_id=str(session.get("student_id", ""))
-                )
 
-                if url:
-                    print(f"\n✅ Your worksheet is ready!")
-                    print(f"   🔗 {url}")
-                else:
-                    print("\n🚧 Worksheet generation coming soon!")
+def process(phone: str, text: str):
+    """Runs in the background so we can ACK Meta immediately."""
+    import asyncio
+    try:
+        reply = handle(phone, text)
+    except Exception as e:
+        print(f"Handler error: {e}")
+        reply = "Something went wrong on our end. Please try again."
+    asyncio.run(send_message(phone, reply))
 
-            print("\nIs there anything else I can help you with?")
 
-        except KeyboardInterrupt:
-            print(f"\n\n👋 Thank you for using Whatsprep, {session['name']}! Goodbye!")
-            exit()
-        except Exception as e:
-            print(f"⚠️  Something went wrong: {e}. Please try again.")
-            continue
+@app.post("/")
+async def receive(request: Request, background: BackgroundTasks):
+    body = await request.json()
 
-# ─────────────────────────────────────────
-# RUN
-# ─────────────────────────────────────────
-greet_and_register()
+    try:
+        value = body["entry"][0]["changes"][0]["value"]
+    except (KeyError, IndexError):
+        return {"status": "ignored"}
 
+    # Delivery / read receipts for messages we sent
+    for st in value.get("statuses", []):
+        print(f"STATUS {st.get('status')} -> {st.get('recipient_id')} "
+              f"({st.get('id')}) {st.get('errors', '')}")
+
+    msgs = value.get("messages", [])
+    if not msgs:
+        return {"status": "ok"}
+
+    msg = msgs[0]
+    text = (msg.get("text") or {}).get("body", "").strip()
+    if not text:
+        return {"status": "no_text"}
+
+    background.add_task(process, msg["from"], text)
+    return {"status": "ok"}
+
+    
