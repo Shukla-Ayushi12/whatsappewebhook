@@ -461,7 +461,7 @@ def handle(phone: str, text: str) -> str:
         if check_if_done(text):
             name = d.get("name", "")
             SESSIONS.pop(phone, None)
-            return f"Thank you for using WhatsPrep, {name}. Goodbye!"
+            return f"Thank you for using WhatsPrep. Goodbye!"
 
         subject = validate_subject(text)
         if subject == "Unknown":
