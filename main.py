@@ -404,7 +404,7 @@ def handle(phone: str, text: str) -> str:
                 "student_id": c.get("student_id", ""),
             })
             s["step"] = "menu"
-            return f"Great, let's get started!\n\n{menu_prompt(d['name'])}"
+            return f"Great, let's get \n\n{menu_prompt(d['name'])} started!"
         if ans is False:
             return start_registration(s)
         return "Sorry, I didn't quite catch that — is that a yes or a no?"
