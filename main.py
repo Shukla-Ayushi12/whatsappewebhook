@@ -148,6 +148,32 @@ def extract_student_identifier(text: str) -> tuple:
     except Exception:
         return "UNKNOWN", "UNKNOWN"
 
+# ---------------------------------------------------------------- yes/no
+YES = {"yes","y","yup","yeah","yea","ya","yep","yah","sure","ok","okay","okok",
+       "correct","right","true","confirm","confirmed","that's right","thats right",
+       "yes please","correct la","can","👍","✅"}
+NO  = {"no","n","nope","nah","naw","not","wrong","incorrect","false",
+       "not really","no lah","cannot","❌"}
+
+def parse_yes_no(t: str):
+    if not t:
+        return None
+    t = t.strip().lower().strip(".!,?")
+    if t in YES:
+        return True
+    if t in NO:
+        return False
+    return None
+
+def ai_yes_no(t: str):
+    r = call_llm([
+        {"role": "system", "content":
+         "Classify the reply to a yes/no question. "
+         "Reply with exactly one word: YES, NO, or UNCLEAR."},
+        {"role": "user", "content": t},
+    ], max_tokens=5)
+    a = (r or "").strip().upper()
+    return True if a == "YES" else False if a == "NO" else None
 
 # ---------------------------------------------------------------- local db
 def load_database() -> list:
@@ -366,8 +392,10 @@ def handle(phone: str, text: str) -> str:
 
     # ---------- confirm the matched student
     if step == "confirm_student":
-        ans = text.strip().lower()
-        if ans in ("yes", "y"):
+        ans = parse_yes_no(text)
+        if ans is None:
+            ans = ai_yes_no(text)
+        if ans is True:
             c = d["candidate"]
             d.update({
                 "name": c["name"],
@@ -377,9 +405,9 @@ def handle(phone: str, text: str) -> str:
             })
             s["step"] = "menu"
             return f"Great, let's get started!\n\n{menu_prompt(d['name'])}"
-        if ans in ("no", "n"):
+        if ans is False:
             return start_registration(s)
-        return "Please reply yes or no."
+        return "Sorry, I didn't quite catch that — is that a yes or a no?"
 
     # ---------- registration
     if step == "reg_name":
@@ -407,14 +435,16 @@ def handle(phone: str, text: str) -> str:
         return confirm_details_text(d)
 
     if step == "confirm_details":
-        ans = text.strip().lower()
-        if ans in ("yes", "y"):
+        ans = parse_yes_no(text)
+        if ans is None:
+            ans = ai_yes_no(text)
+        if ans is True:
             return do_register(s)
-        if ans in ("no", "n"):
+        if ans is False:
             s["step"] = "fix_field"
             return ("Which field would you like to fix?\n\n"
                     "1. Name\n2. Level\n3. Gender\n\nReply with the number.")
-        return "Please reply yes or no."
+        return "Sorry, I didn't quite catch that — is that a yes or a no?"
 
     if step == "fix_field":
         choice = text.strip()
