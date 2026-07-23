@@ -39,6 +39,9 @@ DB_FILE = "students.json"
 # phone -> {"step": str, "data": dict}
 SESSIONS: dict[str, dict] = {}
 
+# message IDs we've already handled, so Meta's retries don't get double replies
+PROCESSED_IDS: set[str] = set()
+
 LEVELS = ["Primary 1", "Primary 2", "Primary 3",
           "Primary 4", "Primary 5", "Primary 6"]
 
@@ -617,11 +620,17 @@ async def receive(request: Request, background: BackgroundTasks):
         return {"status": "ok"}
 
     msg = msgs[0]
+
+    msg_id = msg.get("id")
+    if msg_id in PROCESSED_IDS:
+        return {"status": "duplicate"}
+    PROCESSED_IDS.add(msg_id)
+    if len(PROCESSED_IDS) > 1000:
+        PROCESSED_IDS.clear()
+
     text = (msg.get("text") or {}).get("body", "").strip()
     if not text:
         return {"status": "no_text"}
 
     background.add_task(process, msg["from"], text)
     return {"status": "ok"}
-
-    
