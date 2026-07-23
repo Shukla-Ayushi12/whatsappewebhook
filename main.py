@@ -416,24 +416,18 @@ def topic_name_for(topics: list, topic_id) -> str:
 
 
 def confirm_request_text(d: dict) -> str:
-    """The single confirmation shown before anything is generated."""
     label = d.get("subtopic_name") or d.get("topic_name", "that topic")
-    lines = [f"To confirm: practice on {label}, "
+    lines = [f"Okay great! Generating a practice on {label}, "
              f"{d['difficulty'].lower()} difficulty."]
 
     if SUPPORTS_QUESTION_OPTIONS:
-        lines.append(
-            f"\nI'll prepare {d['count']} {d['type'].lower()} questions, which is "
-            f"what I'd usually suggest for {d.get('level', 'this level')}."
-        )
-        lines.append("\nSound good? Or tell me what to change, for example "
-                     "\"make it 15 questions\" or \"open-ended instead\".")
-    else:
-        lines.append("\nSound good? Or tell me what to change, for example "
-                     "\"make it harder\" or \"show subtopics\".")
+        lines.append(f"\nI'll put together {d['count']} {d['type'].lower()} questions, "
+                     f"which is what usually works well for {d.get('level', 'this level')}.")
 
+    lines.append("\nLet me know if you want to change anything, for example "
+                 "\"make it medium difficulty instead\" or \"show subtopics\". "
+                 "Otherwise just say go ahead!")
     return "\n".join(lines)
-
 
 def prepare_confirmation(s: dict) -> str:
     """Fill any gaps from level defaults, then ask for one confirmation."""
