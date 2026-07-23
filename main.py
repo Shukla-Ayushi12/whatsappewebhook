@@ -36,14 +36,39 @@ registry = StudentRegistry(
 
 DB_FILE = "students.json"
 
+# Set to True only once the platform /generate-assessment endpoint is confirmed
+# to accept question_count and question_type. While False, the bot still picks
+# sensible values internally but does not promise them to the parent.
+SUPPORTS_QUESTION_OPTIONS = False
+
 # phone -> {"step": str, "data": dict}
 SESSIONS: dict[str, dict] = {}
 
-# message IDs we've already handled, so Meta's retries don't get double replies
+# Message IDs already handled, so Meta's delivery retries don't send duplicate replies
 PROCESSED_IDS: set[str] = set()
 
 LEVELS = ["Primary 1", "Primary 2", "Primary 3",
           "Primary 4", "Primary 5", "Primary 6"]
+
+# What a paper should look like for each level, so parents never have to say.
+LEVEL_DEFAULTS = {
+    "Primary 1": {"count": 10, "type": "MCQ"},
+    "Primary 2": {"count": 10, "type": "MCQ"},
+    "Primary 3": {"count": 15, "type": "MCQ"},
+    "Primary 4": {"count": 15, "type": "Mixed"},
+    "Primary 5": {"count": 20, "type": "Mixed"},
+    "Primary 6": {"count": 25, "type": "Open-ended"},
+}
+
+
+def defaults_for(level: str, difficulty: str) -> dict:
+    """Sensible question count and type for a level, nudged by difficulty."""
+    d = dict(LEVEL_DEFAULTS.get(level, {"count": 15, "type": "Mixed"}))
+    if difficulty == "Hard":
+        d["count"] = max(5, d["count"] - 5)
+    elif difficulty == "Easy" and d["count"] < 25:
+        d["count"] += 5
+    return d
 
 
 # ---------------------------------------------------------------- sending
@@ -78,31 +103,114 @@ def call_llm(messages: list, max_tokens: int = 50) -> str:
         return ""
 
 
-def wants_to_exit(text: str) -> bool:
-    r = call_llm([{"role": "user", "content": f"""Does this message CLEARLY mean the person wants to leave, quit, or end the conversation?
+def is_finished(text: str, at_menu: bool = False) -> bool:
+    """Merged replacement for wants_to_exit + check_if_done.
+
+    One LLM call instead of two. The at_menu flag captures the only real
+    difference between the old pair: at the menu a bare "no" means "nothing
+    more", whereas mid-flow "no" is usually an answer to a question.
+    """
+    extra = ('- At this point a bare "no", "nope" or "nothing" means YES, they are finished.\n'
+             if at_menu else
+             '- A bare "no" here is probably answering a question, so return "no".\n')
+    r = call_llm([{"role": "user", "content": f"""Does this message mean the person wants to stop, leave, or has nothing more to ask?
 
 Message: "{text}"
 
 Return ONLY "yes" or "no".
-- Only "yes" if unambiguously about leaving (exit, quit, bye, stop, no thanks, i'm done)
-- Typos or partial words that could be answers (e.g. "mat" for "math") return "no"
+- "yes" only if clearly about leaving or being done (exit, quit, bye, stop, that's all, i'm done, no thanks)
+{extra}- Typos or partial words that could be answers (e.g. "mat" for "math") return "no"
+- If they are asking for practice or naming a topic, return "no"
 - When unsure, return "no"
 """}], max_tokens=5)
-    return r.lower() == "yes"
+    return r.lower().startswith("yes")
 
 
-def check_if_done(text: str) -> bool:
-    r = call_llm([{"role": "user", "content": f"""Does this message mean the person wants to stop, end, or has nothing more to ask?
+# ---------------------------------------------------------------- yes / no parsing
+YES = {"yes", "y", "yup", "yeah", "yea", "ya", "yep", "yah", "sure", "ok", "okay",
+       "okok", "correct", "right", "true", "confirm", "confirmed", "that's right",
+       "thats right", "yes please", "correct la", "can", "go ahead", "please",
+       "sounds good", "perfect", "great", "\U0001F44D", "\u2705"}
 
-Message: "{text}"
-
-Return ONLY "yes" or "no".
-- "no" on its own means YES they are done
-- Only return "no" if they are clearly asking for math or a topic
-"""}], max_tokens=5)
-    return r.lower() == "yes"
+NO = {"no", "n", "nope", "nah", "naw", "not", "wrong", "incorrect", "false",
+      "not really", "no lah", "cannot", "\u274C"}
 
 
+def parse_yes_no(text: str):
+    """Fast local check. Returns True / False / None (unclear). No API call."""
+    if not text:
+        return None
+    t = text.strip().lower().strip(".!,?")
+    if t in YES:
+        return True
+    if t in NO:
+        return False
+    return None
+
+
+def ai_yes_no(text: str):
+    """LLM fallback for phrasing the local check missed."""
+    r = call_llm([
+        {"role": "system", "content":
+         "Classify a reply to a yes/no question. Answer with exactly one word: "
+         "YES, NO, or UNCLEAR. Treat affirmations ('that's right', 'she is', "
+         "'go ahead') as YES and denials ('not quite', 'wrong one') as NO."},
+        {"role": "user", "content": text},
+    ], max_tokens=5)
+    a = (r or "").strip().upper()
+    return True if a.startswith("YES") else False if a.startswith("NO") else None
+
+
+def read_yes_no(text: str):
+    """Local check first, LLM only when unclear."""
+    ans = parse_yes_no(text)
+    return ans if ans is not None else ai_yes_no(text)
+
+
+# ---------------------------------------------------------------- request extraction
+def extract_request(text: str, topics: list) -> dict:
+    """Pull everything a parent stated in one message, in a single LLM call.
+
+    Returns only the fields they actually indicated. Anything absent stays out,
+    so the caller can fill it from level defaults instead of asking.
+    """
+    topic_list = "\n".join(
+        f"{t.get('topic_id')}: {t.get('topic_name')}" for t in topics
+    )
+    r = call_llm([{"role": "user", "content": f"""A parent is asking for maths practice for their child.
+
+Available topics:
+{topic_list}
+
+Their message: "{text}"
+
+Return ONLY a JSON object, no markdown fences, no explanation:
+{{"topic_id": <id from the list, or null>,
+  "difficulty": "Easy 🟢" | "Medium 🟡" | "Hard 🔴" | null,
+  "count": <number of questions, or null>,
+  "type": "MCQ" | "Open-ended" | "Mixed" | null,
+  "wants_subtopics": true | false}}
+
+Rules:
+- Only fill a field if the parent clearly indicated it. Use null otherwise.
+- Match topics loosely: "decimals", "the fraction one", "fractions pls" should all match.
+- A bare number like "2" means they picked topic number 2 from a list, not a count.
+- "wants_subtopics" is true only if they asked to narrow down or see subtopics.
+"""}], max_tokens=120)
+
+    raw = (r or "").strip()
+    if raw.startswith("```"):
+        raw = raw.strip("`")
+        raw = raw[4:] if raw.lower().startswith("json") else raw
+    try:
+        data = json.loads(raw)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        print(f"extract_request could not parse: {raw!r}")
+        return {}
+
+
+# ---------------------------------------------------------------- validators
 def validate_name(text: str) -> str:
     r = call_llm([{"role": "user", "content": f"""Extract only the child's name from: "{text}"
 Return ONLY the name, properly capitalised. If none, return "Unknown"."""}])
@@ -125,21 +233,6 @@ Return ONLY "Male", "Female", or "Unknown".
     return r if r in ["Male", "Female"] else "Unknown"
 
 
-def validate_subject(text: str) -> str:
-    r = call_llm([{"role": "user", "content": f"""Does this message indicate the person wants Math practice questions?
-
-Message: "{text}"
-
-Return ONLY "Math" if yes, or "Unknown" if no."""}])
-    return "Math" if r == "Math" else "Unknown"
-
-
-def validate_difficulty(text: str) -> str:
-    r = call_llm([{"role": "user", "content": f"""Extract difficulty from: "{text}"
-Return ONLY "Easy", "Medium", or "Hard". If unclear, "Medium"."""}])
-    return r if r in ["Easy", "Medium", "Hard"] else "Medium"
-
-
 def extract_student_identifier(text: str) -> tuple:
     r = call_llm([{"role": "user", "content": f"""Extract either a student name or student ID from: "{text}"
 - Student ID (S0012, or plain number like 15): return ID|<id>
@@ -151,32 +244,6 @@ def extract_student_identifier(text: str) -> tuple:
     except Exception:
         return "UNKNOWN", "UNKNOWN"
 
-# ---------------------------------------------------------------- yes/no
-YES = {"yes","y","yup","yeah","yea","ya","yep","yah","sure","ok","okay","okok",
-       "correct","right","true","confirm","confirmed","that's right","thats right",
-       "yes please","correct la","can","👍","✅"}
-NO  = {"no","n","nope","nah","naw","not","wrong","incorrect","false",
-       "not really","no lah","cannot","❌"}
-
-def parse_yes_no(t: str):
-    if not t:
-        return None
-    t = t.strip().lower().strip(".!,?")
-    if t in YES:
-        return True
-    if t in NO:
-        return False
-    return None
-
-def ai_yes_no(t: str):
-    r = call_llm([
-        {"role": "system", "content":
-         "Classify the reply to a yes/no question. "
-         "Reply with exactly one word: YES, NO, or UNCLEAR."},
-        {"role": "user", "content": t},
-    ], max_tokens=5)
-    a = (r or "").strip().upper()
-    return True if a == "YES" else False if a == "NO" else None
 
 # ---------------------------------------------------------------- local db
 def load_database() -> list:
@@ -215,7 +282,7 @@ def find_student_locally(kind: str, value: str) -> dict | None:
 
 
 # ---------------------------------------------------------------- platform api
-def get_topics(student_id, subject: str) -> list | None:
+def get_topics(student_id, subject: str = "Math") -> list | None:
     try:
         sid = int(student_id)
     except (ValueError, TypeError):
@@ -257,16 +324,26 @@ def get_subtopics(student_id, topic_id: str) -> list | None:
     return None
 
 
-def generate_worksheet_url(student_id, topic_id: str, difficulty: str) -> str | None:
+def generate_worksheet_url(student_id, topic_id: str, difficulty: str,
+                           count: int | None = None,
+                           qtype: str | None = None) -> str | None:
     try:
         sid, tid = int(student_id), int(topic_id)
     except (ValueError, TypeError):
         return None
+
+    payload = {"topic_id": tid, "student_id": sid, "difficulty": difficulty}
+    if SUPPORTS_QUESTION_OPTIONS:
+        if count:
+            payload["question_count"] = count
+        if qtype:
+            payload["question_type"] = qtype
+
     try:
         r = requests.post(
             "https://latam.whatsprep.com/api/generate-assessment",
             headers=registry.headers,
-            json={"topic_id": tid, "student_id": sid, "difficulty": difficulty},
+            json=payload,
             timeout=30,
         )
         if r.status_code == 200:
@@ -278,7 +355,7 @@ def generate_worksheet_url(student_id, topic_id: str, difficulty: str) -> str | 
     return None
 
 
-# ---------------------------------------------------------------- flow
+# ---------------------------------------------------------------- flow helpers
 def session_for(phone: str) -> dict:
     if phone not in SESSIONS:
         SESSIONS[phone] = {"step": "start", "data": {}}
@@ -286,13 +363,15 @@ def session_for(phone: str) -> dict:
 
 
 def format_topics(topics: list) -> str:
-    lines = [f"{i}. {t.get('topic_name', f'Topic {i}')}" for i, t in enumerate(topics, 1)]
-    return "\n".join(lines)
+    return "\n".join(
+        f"{i}. {t.get('topic_name', f'Topic {i}')}" for i, t in enumerate(topics, 1)
+    )
 
 
 def menu_prompt(name: str) -> str:
     return (f"How can I help {name} today?\n\n"
-            f"Tell me what you'd like, e.g. \"I want Math questions\".")
+            f"Just tell me what you'd like, e.g. \"easy fractions practice\".")
+
 
 def start_registration(s: dict) -> str:
     s["step"] = "reg_name"
@@ -305,7 +384,7 @@ def confirm_details_text(d: dict) -> str:
             f"Level: {d['level']}\n"
             f"Gender: {d['gender']}\n"
             f"Phone: {d['phone']}\n\n"
-            f"Is this correct? (yes/no)")
+            f"Is this correct?")
 
 
 def do_register(s: dict) -> str:
@@ -321,30 +400,100 @@ def do_register(s: dict) -> str:
             f"Student ID: {student_id}\n\n{menu_prompt(d['name'])}")
 
 
-def load_and_show_topics(s: dict) -> str:
+def ensure_topics(s: dict) -> list | None:
+    """Load the topic list once per session and cache it."""
     d = s["data"]
-    topics = get_topics(d.get("student_id"), d["subject"])
-    if not topics:
-        s["step"] = "menu"
-        return "Sorry, I couldn't load the topics right now. Please try again shortly."
-    d["topics"] = topics
-    s["step"] = "topic"
-    return (f"Here are the available topics for {d['name']}:\n\n"
-            f"{format_topics(topics)}\n\n"
-            f"Reply with the number(s), e.g. \"1\" or \"1,2,3\".")
+    if not d.get("topics"):
+        d["topics"] = get_topics(d.get("student_id")) or []
+    return d["topics"] or None
 
 
+def topic_name_for(topics: list, topic_id) -> str:
+    for t in topics:
+        if str(t.get("topic_id")) == str(topic_id):
+            return t.get("topic_name", "that topic")
+    return "that topic"
+
+
+def confirm_request_text(d: dict) -> str:
+    """The single confirmation shown before anything is generated."""
+    label = d.get("subtopic_name") or d.get("topic_name", "that topic")
+    lines = [f"To confirm: practice on {label}, "
+             f"{d['difficulty'].lower()} difficulty."]
+
+    if SUPPORTS_QUESTION_OPTIONS:
+        lines.append(
+            f"\nI'll prepare {d['count']} {d['type'].lower()} questions, which is "
+            f"what I'd usually suggest for {d.get('level', 'this level')}."
+        )
+        lines.append("\nSound good? Or tell me what to change, for example "
+                     "\"make it 15 questions\" or \"open-ended instead\".")
+    else:
+        lines.append("\nSound good? Or tell me what to change, for example "
+                     "\"make it harder\" or \"show subtopics\".")
+
+    return "\n".join(lines)
+
+
+def prepare_confirmation(s: dict) -> str:
+    """Fill any gaps from level defaults, then ask for one confirmation."""
+    d = s["data"]
+    d.setdefault("difficulty", "Medium")
+    picked = defaults_for(d.get("level", ""), d["difficulty"])
+    d.setdefault("count", picked["count"])
+    d.setdefault("type", picked["type"])
+    s["step"] = "confirm_request"
+    return confirm_request_text(d)
+
+
+def apply_request(d: dict, req: dict, topics: list) -> None:
+    """Merge whatever the parent stated into the pending request."""
+    if req.get("topic_id"):
+        d["topic_id"] = str(req["topic_id"])
+        d["topic_name"] = topic_name_for(topics, req["topic_id"])
+        d.pop("subtopic_id", None)
+        d.pop("subtopic_name", None)
+    if req.get("difficulty"):
+        d["difficulty"] = req["difficulty"]
+    if req.get("count"):
+        d["count"] = int(req["count"])
+    if req.get("type"):
+        d["type"] = req["type"]
+
+
+def generate_and_reply(s: dict) -> str:
+    d = s["data"]
+    target = d.get("subtopic_id") or d.get("topic_id")
+    url = generate_worksheet_url(
+        d.get("student_id"), str(target).strip(), d["difficulty"],
+        count=d.get("count"), qtype=d.get("type"),
+    )
+
+    # Clear the pending request but keep the child's profile for the next round
+    for k in ("topic_id", "topic_name", "subtopic_id", "subtopic_name",
+              "difficulty", "count", "type", "subtopics"):
+        d.pop(k, None)
+    s["step"] = "menu"
+
+    if not url:
+        return ("Sorry, I couldn't generate that worksheet just now. "
+                "Please try again in a moment.")
+    return (f"Here's the practice, ready to go.\n\n{url}\n\n"
+            f"Anything else I can help with?")
+
+
+# ---------------------------------------------------------------- main handler
 def handle(phone: str, text: str) -> str:
     """One inbound message in, one reply out."""
     s = session_for(phone)
     d = s["data"]
     step = s["step"]
 
-    # Global exit, valid at any step
-    if step not in ("reg_name",) and wants_to_exit(text):
+    # Global exit, valid at any step except when we're asking for a name
+    if step not in ("reg_name",) and is_finished(text, at_menu=(step == "menu")):
         name = d.get("name", "")
         SESSIONS.pop(phone, None)
-        return f"Thank you for using WhatsPrep{', ' + name if name else ''}. Goodbye!"
+        return f"Thank you for using WhatsPrep{', ' + name if name else ''}. Goodbye! 🙏"
 
     # ---------- start: identify the parent by their WhatsApp number
     if step == "start":
@@ -358,7 +507,7 @@ def handle(phone: str, text: str) -> str:
                 d["candidate"] = student
                 s["step"] = "confirm_student"
                 lvl = student.get("primary_level") or "Unknown level"
-                return f"Is your child {student['name']} in {lvl}? (yes/no)"
+                return f"Is your child {student['name']} in {lvl}?"
 
         found = registry.check_student_exists(local_phone) \
             or check_existing_student_local(local_phone)
@@ -367,8 +516,8 @@ def handle(phone: str, text: str) -> str:
             d["candidate"] = found[0]
             s["step"] = "confirm_student"
             lvl = found[0].get("primary_level") or "Unknown level"
-            return (f"Welcome back to WhatsPrep!\n\n"
-                    f"Is your child {found[0]['name']} in {lvl}? (yes/no)")
+            return (f"Welcome back to WhatsPrep! 👋\n\n"
+                    f"Is your child {found[0]['name']} in {lvl}?")
 
         if found and len(found) > 1:
             d["found"] = found
@@ -378,7 +527,7 @@ def handle(phone: str, text: str) -> str:
             return ("We found more than one child under this number:\n\n"
                     + "\n".join(lines) + "\n\nWhich child is this for? Reply with the number.")
 
-        return "Hi! Welcome to WhatsPrep.\n\n" + start_registration(s)
+        return "Hi! Welcome to WhatsPrep.🤝\n\n" + start_registration(s)
 
     # ---------- pick between siblings
     if step == "pick_student":
@@ -390,13 +539,11 @@ def handle(phone: str, text: str) -> str:
         d["candidate"] = chosen
         s["step"] = "confirm_student"
         lvl = chosen.get("primary_level") or "Unknown level"
-        return f"Is your child {chosen['name']} in {lvl}? (yes/no)"
+        return f"Is your child {chosen['name']} in {lvl}?"
 
     # ---------- confirm the matched student
     if step == "confirm_student":
-        ans = parse_yes_no(text)
-        if ans is None:
-            ans = ai_yes_no(text)
+        ans = read_yes_no(text)
         if ans is True:
             c = d["candidate"]
             d.update({
@@ -437,9 +584,7 @@ def handle(phone: str, text: str) -> str:
         return confirm_details_text(d)
 
     if step == "confirm_details":
-        ans = parse_yes_no(text)
-        if ans is None:
-            ans = ai_yes_no(text)
+        ans = read_yes_no(text)
         if ans is True:
             return do_register(s)
         if ans is False:
@@ -459,126 +604,112 @@ def handle(phone: str, text: str) -> str:
         d["returning_to_confirm"] = True
         return prompt
 
-    # ---------- main menu
+    # ---------- main menu: understand as much as possible from one message
     if step == "menu":
-        if check_if_done(text):
-            name = d.get("name", "")
-            SESSIONS.pop(phone, None)
-            return f"Thank you for using WhatsPrep. Goodbye!"
+        topics = ensure_topics(s)
+        if not topics:
+            return ("Sorry, I couldn't load the topics right now. "
+                    "Please try again shortly.")
 
-        subject = validate_subject(text)
-        if subject == "Unknown":
-            return ("We currently offer Math only.\n\n"
-                    "Reply \"Math\" to see the available topics.")
-        d["subject"] = subject
-        return load_and_show_topics(s)
+        req = extract_request(text, topics)
+        apply_request(d, req, topics)
 
-    # ---------- topic selection
+        if req.get("wants_subtopics") and d.get("topic_id"):
+            return show_subtopics(s)
+
+        if not d.get("topic_id"):
+            s["step"] = "topic"
+            return (f"Here's what {d.get('name', 'your child')} can practise:\n\n"
+                    f"{format_topics(topics)}\n\n"
+                    f"Just tell me which one, or say something like "
+                    f"\"easy fractions\".")
+
+        return prepare_confirmation(s)
+
+    # ---------- topic selection, accepting a number or free text
     if step == "topic":
-        topics = d["topics"]
-        raw = re.split(r"[,\s]+", text.strip())
-        indices, seen = [], set()
-        for c in raw:
-            if not c:
-                continue
-            try:
-                i = int(c) - 1
-            except ValueError:
-                return f"\"{c}\" isn't a number. Please reply with numbers between 1 and {len(topics)}."
+        topics = d.get("topics") or []
+
+        raw = text.strip()
+        if raw.isdigit():
+            i = int(raw) - 1
             if not (0 <= i < len(topics)):
-                return f"\"{c}\" is out of range. Please pick between 1 and {len(topics)}."
-            if i not in seen:
-                seen.add(i)
-                indices.append(i)
+                return f"Please pick a number between 1 and {len(topics)}."
+            d["topic_id"] = str(topics[i].get("topic_id", ""))
+            d["topic_name"] = topics[i].get("topic_name", "")
+        else:
+            req = extract_request(text, topics)
+            apply_request(d, req, topics)
+            if req.get("wants_subtopics") and d.get("topic_id"):
+                return show_subtopics(s)
+            if not d.get("topic_id"):
+                return ("I didn't catch which topic you meant. You can reply with "
+                        f"a number from 1 to {len(topics)}, or name the topic.")
 
-        if not indices:
-            return "Please reply with a topic number."
+        return prepare_confirmation(s)
 
-        selected = [topics[i] for i in indices]
-        d["topic_ids"] = [str(t.get("topic_id", "")) for t in selected]
-        d["topic_names"] = [t.get("topic_name", "") for t in selected]
-
-        names = "\n".join(f"• {n}" for n in d["topic_names"])
-
-        if len(d["topic_ids"]) > 1:
-            d["subtopic_id"] = None
-            s["step"] = "difficulty"
-            return (f"Selected:\n{names}\n\n"
-                    f"Multiple topics selected, so we'll use the broad topics.\n\n"
-                    f"What difficulty?\n1. Easy\n2. Medium\n3. Hard")
-
-        s["step"] = "subtopic_choice"
-        return (f"Selected:\n{names}\n\n"
-                f"Would you like a specific subtopic, or the broad topic?\n\n"
-                f"1. Show me subtopics\n2. Use the broad topic")
-
-    # ---------- subtopic
-    if step == "subtopic_choice":
-        choice = text.strip()
-        if choice == "2":
-            d["subtopic_id"] = None
-            s["step"] = "difficulty"
-            return "What difficulty?\n1. Easy\n2. Medium\n3. Hard"
-        if choice != "1":
-            return "Please reply with 1 or 2."
-
-        subs = get_subtopics(d.get("student_id"), d["topic_ids"][0])
-        if not subs:
-            d["subtopic_id"] = None
-            s["step"] = "difficulty"
-            return ("Couldn't load subtopics, so we'll use the broad topic.\n\n"
-                    "What difficulty?\n1. Easy\n2. Medium\n3. Hard")
-
-        d["subtopics"] = subs
-        s["step"] = "subtopic_pick"
-        lines = [f"{i}. {sub.get('subtopic_name', sub.get('name', f'Subtopic {i}'))}"
-                 for i, sub in enumerate(subs, 1)]
-        return (f"Subtopics under {d['topic_names'][0]}:\n\n"
-                + "\n".join(lines) + "\n\nReply with the number.")
-
+    # ---------- optional subtopic narrowing
     if step == "subtopic_pick":
-        subs = d["subtopics"]
-        try:
-            i = int(text.strip()) - 1
+        subs = d.get("subtopics") or []
+        raw = text.strip()
+        if raw.isdigit():
+            i = int(raw) - 1
+            if not (0 <= i < len(subs)):
+                return f"Please pick a number between 1 and {len(subs)}."
             chosen = subs[i]
-        except (ValueError, IndexError):
-            return f"Please reply with a number between 1 and {len(subs)}."
-        d["subtopic_id"] = chosen.get("subtopic_id", chosen.get("id", ""))
-        d["subtopic_name"] = chosen.get("subtopic_name", chosen.get("name", ""))
-        s["step"] = "difficulty"
-        return (f"Subtopic: {d['subtopic_name']}\n\n"
-                f"What difficulty?\n1. Easy\n2. Medium\n3. Hard")
+            d["subtopic_id"] = chosen.get("subtopic_id", chosen.get("id", ""))
+            d["subtopic_name"] = chosen.get("subtopic_name", chosen.get("name", ""))
+            return prepare_confirmation(s)
+        # Anything else, treat as "just use the broad topic"
+        return prepare_confirmation(s)
 
-    # ---------- difficulty, then generate
-    if step == "difficulty":
-        mapping = {"1": "Easy", "2": "Medium", "3": "Hard"}
-        difficulty = mapping.get(text.strip()) or validate_difficulty(text)
-        d["difficulty"] = difficulty
+    # ---------- the single confirmation before generating
+    if step == "confirm_request":
+        ans = parse_yes_no(text)
+        if ans is True:
+            return generate_and_reply(s)
 
-        ids = [d["subtopic_id"]] if d.get("subtopic_id") else d["topic_ids"]
+        topics = d.get("topics") or []
+        req = extract_request(text, topics)
 
-        urls = []
-        for tid in ids:
-            url = generate_worksheet_url(d.get("student_id"), str(tid).strip(), difficulty)
-            if url:
-                urls.append(url)
+        if req.get("wants_subtopics"):
+            return show_subtopics(s)
 
-        s["step"] = "menu"
+        if any(req.get(k) for k in ("topic_id", "difficulty", "count", "type")):
+            apply_request(d, req, topics)
+            return confirm_request_text(d)
 
-        if not urls:
-            return ("Sorry, worksheet generation failed. Please try again shortly.\n\n"
-                    "Anything else I can help with?")
+        if ans is False:
+            return ("No problem. What would you like to change? You can say things "
+                    "like \"make it harder\", \"a different topic\", or "
+                    "\"show subtopics\".")
 
-        if len(urls) == 1:
-            return (f"Your worksheet is ready.\n\n{urls[0]}\n\n"
-                    f"Anything else I can help with?")
+        # Fall back to the slower classifier only when nothing else matched
+        if ai_yes_no(text) is True:
+            return generate_and_reply(s)
 
-        lines = "\n".join(f"Worksheet {i}: {u}" for i, u in enumerate(urls, 1))
-        return f"Your worksheets are ready.\n\n{lines}\n\nAnything else I can help with?"
+        return ("Sorry, I didn't quite catch that. Reply \"yes\" to go ahead, or "
+                "tell me what to change.")
 
     # ---------- fallback
     s["step"] = "menu"
     return menu_prompt(d.get("name", "there"))
+
+
+def show_subtopics(s: dict) -> str:
+    """Only reached when a parent asks to narrow down, never forced on them."""
+    d = s["data"]
+    subs = get_subtopics(d.get("student_id"), d.get("topic_id"))
+    if not subs:
+        return ("I couldn't load subtopics for that one, so we'll use the broad "
+                "topic.\n\n" + prepare_confirmation(s))
+    d["subtopics"] = subs
+    s["step"] = "subtopic_pick"
+    lines = [f"{i}. {sub.get('subtopic_name', sub.get('name', f'Subtopic {i}'))}"
+             for i, sub in enumerate(subs, 1)]
+    return (f"Subtopics under {d.get('topic_name', 'that topic')}:\n\n"
+            + "\n".join(lines)
+            + "\n\nReply with a number, or say \"broad topic is fine\".")
 
 
 # ---------------------------------------------------------------- webhook
@@ -621,6 +752,7 @@ async def receive(request: Request, background: BackgroundTasks):
 
     msg = msgs[0]
 
+    # Meta retries delivery if we're slow to ACK, which caused duplicate replies
     msg_id = msg.get("id")
     if msg_id in PROCESSED_IDS:
         return {"status": "duplicate"}
@@ -634,3 +766,4 @@ async def receive(request: Request, background: BackgroundTasks):
 
     background.add_task(process, msg["from"], text)
     return {"status": "ok"}
+
