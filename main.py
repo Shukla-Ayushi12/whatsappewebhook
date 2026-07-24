@@ -60,6 +60,10 @@ LEVEL_DEFAULTS = {
     "Primary 6": {"count": 25, "type": "Open-ended"},
 }
 
+# Phrases that suggest the parent wants a different child than the one we picked
+SWITCH_HINTS = ("wrong", "different child", "another child", "not ", "switch",
+                "other kid", "other child", "my other")
+
 
 def defaults_for(level: str, difficulty: str) -> dict:
     """Sensible question count and type for a level, nudged by difficulty."""
@@ -121,6 +125,7 @@ Return ONLY "yes" or "no".
 - "yes" only if clearly about leaving or being done (exit, quit, bye, stop, that's all, i'm done, no thanks)
 {extra}- Typos or partial words that could be answers (e.g. "mat" for "math") return "no"
 - If they are asking for practice or naming a topic, return "no"
+- If they are asking about a different child, return "no"
 - When unsure, return "no"
 """}], max_tokens=5)
     return r.lower().startswith("yes")
@@ -186,7 +191,7 @@ Their message: "{text}"
 
 Return ONLY a JSON object, no markdown fences, no explanation:
 {{"topic_id": <id from the list, or null>,
-  "difficulty": "Easy 🟢" | "Medium 🟡" | "Hard 🔴" | null,
+  "difficulty": "Easy" | "Medium" | "Hard" | null,
   "count": <number of questions, or null>,
   "type": "MCQ" | "Open-ended" | "Mixed" | null,
   "wants_subtopics": true | false}}
@@ -362,9 +367,30 @@ def session_for(phone: str) -> dict:
     return SESSIONS[phone]
 
 
+def adopt_student(d: dict, c: dict) -> None:
+    """Take a matched child as the active one. No confirmation needed."""
+    d.update({
+        "name": c["name"],
+        "level": c.get("primary_level", ""),
+        "gender": c.get("gender", ""),
+        "student_id": c.get("student_id", ""),
+    })
+    # A different child means a fresh topic list and a fresh request
+    for k in ("topics", "topic_id", "topic_name", "subtopic_id", "subtopic_name",
+              "subtopics", "difficulty", "count", "type"):
+        d.pop(k, None)
+
+
 def format_topics(topics: list) -> str:
     return "\n".join(
         f"{i}. {t.get('topic_name', f'Topic {i}')}" for i, t in enumerate(topics, 1)
+    )
+
+
+def format_children(found: list) -> str:
+    return "\n".join(
+        f"{i}. {c['name']} — {c.get('primary_level') or 'Unknown level'}"
+        for i, c in enumerate(found, 1)
     )
 
 
@@ -401,7 +427,7 @@ def do_register(s: dict) -> str:
 
 
 def ensure_topics(s: dict) -> list | None:
-    """Load the topic list once per session and cache it."""
+    """Load the topic list once per child and cache it."""
     d = s["data"]
     if not d.get("topics"):
         d["topics"] = get_topics(d.get("student_id")) or []
@@ -416,18 +442,21 @@ def topic_name_for(topics: list, topic_id) -> str:
 
 
 def confirm_request_text(d: dict) -> str:
+    """The single confirmation shown before anything is generated."""
     label = d.get("subtopic_name") or d.get("topic_name", "that topic")
     lines = [f"Okay great! Generating a practice on {label}, "
              f"{d['difficulty'].lower()} difficulty."]
 
     if SUPPORTS_QUESTION_OPTIONS:
         lines.append(f"\nI'll put together {d['count']} {d['type'].lower()} questions, "
-                     f"which is what usually works well for {d.get('level', 'this level')}.")
+                     f"which is what usually works well for "
+                     f"{d.get('level', 'this level')}.")
 
     lines.append("\nLet me know if you want to change anything, for example "
                  "\"make it medium difficulty instead\" or \"show subtopics\". "
                  "Otherwise just say go ahead!")
     return "\n".join(lines)
+
 
 def prepare_confirmation(s: dict) -> str:
     """Fill any gaps from level defaults, then ask for one confirmation."""
@@ -455,6 +484,20 @@ def apply_request(d: dict, req: dict, topics: list) -> None:
         d["type"] = req["type"]
 
 
+def wants_different_child(d: dict, text: str) -> bool:
+    """Cheap local check so a mis-matched child can always be corrected."""
+    if not d.get("found") or len(d["found"]) < 2:
+        return False
+    low = text.lower()
+    return any(w in low for w in SWITCH_HINTS)
+
+
+def offer_children(s: dict) -> str:
+    d = s["data"]
+    s["step"] = "pick_student"
+    return "No problem! Which child is this for?\n\n" + format_children(d["found"])
+
+
 def generate_and_reply(s: dict) -> str:
     d = s["data"]
     target = d.get("subtopic_id") or d.get("topic_id")
@@ -472,7 +515,7 @@ def generate_and_reply(s: dict) -> str:
     if not url:
         return ("Sorry, I couldn't generate that worksheet just now. "
                 "Please try again in a moment.")
-    return (f"Here's the practice, ready to go.\n\n{url}\n\n"
+    return (f"Here's the practice, ready to go!\n\n{url}\n\n"
             f"Anything else I can help with?")
 
 
@@ -487,7 +530,7 @@ def handle(phone: str, text: str) -> str:
     if step not in ("reg_name",) and is_finished(text, at_menu=(step == "menu")):
         name = d.get("name", "")
         SESSIONS.pop(phone, None)
-        return f"Thank you for using WhatsPrep{', ' + name if name else ''}. Goodbye! 🙏"
+        return f"Thank you for using WhatsPrep{', ' + name if name else ''}. Goodbye!"
 
     # ---------- start: identify the parent by their WhatsApp number
     if step == "start":
@@ -498,59 +541,37 @@ def handle(phone: str, text: str) -> str:
         if kind in ("NAME", "ID"):
             student = find_student_locally(kind, value)
             if student:
-                d["candidate"] = student
-                s["step"] = "confirm_student"
-                lvl = student.get("primary_level") or "Unknown level"
-                return f"Is your child {student['name']} in {lvl}?"
+                adopt_student(d, student)
+                s["step"] = "menu"
+                return f"Great, let's get started!\n\n{menu_prompt(d['name'])}"
 
         found = registry.check_student_exists(local_phone) \
             or check_existing_student_local(local_phone)
 
         if found and len(found) == 1:
-            d["candidate"] = found[0]
-            s["step"] = "confirm_student"
-            lvl = found[0].get("primary_level") or "Unknown level"
-            return (f"Welcome back to WhatsPrep! 👋\n\n"
-                    f"Is your child {found[0]['name']} in {lvl}?")
+            adopt_student(d, found[0])
+            s["step"] = "menu"
+            return f"Welcome back to WhatsPrep!\n\n{menu_prompt(d['name'])}"
 
         if found and len(found) > 1:
             d["found"] = found
             s["step"] = "pick_student"
-            lines = [f"{i}. {c['name']} — {c.get('primary_level') or 'Unknown level'}"
-                     for i, c in enumerate(found, 1)]
             return ("We found more than one child under this number:\n\n"
-                    + "\n".join(lines) + "\n\nWhich child is this for? Reply with the number.")
+                    + format_children(found)
+                    + "\n\nWhich child is this for? Reply with the number.")
 
-        return "Hi! Welcome to WhatsPrep.🤝\n\n" + start_registration(s)
+        return "Hi! Welcome to WhatsPrep.\n\n" + start_registration(s)
 
-    # ---------- pick between siblings
+    # ---------- pick between siblings, then go straight to the menu
     if step == "pick_student":
         try:
             i = int(text.strip()) - 1
             chosen = d["found"][i]
         except (ValueError, IndexError):
             return f"Please reply with a number between 1 and {len(d['found'])}."
-        d["candidate"] = chosen
-        s["step"] = "confirm_student"
-        lvl = chosen.get("primary_level") or "Unknown level"
-        return f"Is your child {chosen['name']} in {lvl}?"
-
-    # ---------- confirm the matched student
-    if step == "confirm_student":
-        ans = read_yes_no(text)
-        if ans is True:
-            c = d["candidate"]
-            d.update({
-                "name": c["name"],
-                "level": c.get("primary_level", ""),
-                "gender": c.get("gender", ""),
-                "student_id": c.get("student_id", ""),
-            })
-            s["step"] = "menu"
-            return f"Great, let's get started!\n\n{menu_prompt(d['name'])}"
-        if ans is False:
-            return start_registration(s)
-        return "Sorry, I didn't quite catch that — is that a yes or a no?"
+        adopt_student(d, chosen)
+        s["step"] = "menu"
+        return f"Great, let's get started!\n\n{menu_prompt(d['name'])}"
 
     # ---------- registration
     if step == "reg_name":
@@ -600,6 +621,10 @@ def handle(phone: str, text: str) -> str:
 
     # ---------- main menu: understand as much as possible from one message
     if step == "menu":
+        # Escape hatch, since we no longer confirm which child was matched
+        if wants_different_child(d, text):
+            return offer_children(s)
+
         topics = ensure_topics(s)
         if not topics:
             return ("Sorry, I couldn't load the topics right now. "
@@ -622,6 +647,9 @@ def handle(phone: str, text: str) -> str:
 
     # ---------- topic selection, accepting a number or free text
     if step == "topic":
+        if wants_different_child(d, text):
+            return offer_children(s)
+
         topics = d.get("topics") or []
 
         raw = text.strip()
@@ -659,6 +687,9 @@ def handle(phone: str, text: str) -> str:
 
     # ---------- the single confirmation before generating
     if step == "confirm_request":
+        if wants_different_child(d, text):
+            return offer_children(s)
+
         ans = parse_yes_no(text)
         if ans is True:
             return generate_and_reply(s)
@@ -674,7 +705,7 @@ def handle(phone: str, text: str) -> str:
             return confirm_request_text(d)
 
         if ans is False:
-            return ("No problem. What would you like to change? You can say things "
+            return ("No problem! What would you like to change? You can say things "
                     "like \"make it harder\", \"a different topic\", or "
                     "\"show subtopics\".")
 
@@ -682,8 +713,8 @@ def handle(phone: str, text: str) -> str:
         if ai_yes_no(text) is True:
             return generate_and_reply(s)
 
-        return ("Sorry, I didn't quite catch that. Reply \"yes\" to go ahead, or "
-                "tell me what to change.")
+        return ("Sorry, I didn't quite catch that. Say \"go ahead\" and I'll make it, "
+                "or tell me what to change.")
 
     # ---------- fallback
     s["step"] = "menu"
@@ -761,3 +792,4 @@ async def receive(request: Request, background: BackgroundTasks):
     background.add_task(process, msg["from"], text)
     return {"status": "ok"}
 
+    
