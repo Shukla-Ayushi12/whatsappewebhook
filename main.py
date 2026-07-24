@@ -135,7 +135,9 @@ Return ONLY "yes" or "no".
 YES = {"yes", "y", "yup", "yeah", "yea", "ya", "yep", "yah", "sure", "ok", "okay",
        "okok", "correct", "right", "true", "confirm", "confirmed", "that's right",
        "thats right", "yes please", "correct la", "can", "go ahead", "please",
-       "sounds good", "perfect", "great", "\U0001F44D", "\u2705"}
+       "sounds good", "perfect", "great", "\U0001F44D", "\u2705","looks good", "lgtm", "go", "do it", "make it", "send it", "send",
+       "alright", "cool", "fine", "good", "nice", "yes pls", "shoot",
+       "let's go", "lets go", "start", "generate", "\U0001F64F",}
 
 NO = {"no", "n", "nope", "nah", "naw", "not", "wrong", "incorrect", "false",
       "not really", "no lah", "cannot", "\u274C"}
@@ -194,11 +196,15 @@ Return ONLY a JSON object, no markdown fences, no explanation:
   "difficulty": "Easy" | "Medium" | "Hard" | null,
   "count": <number of questions, or null>,
   "type": "MCQ" | "Open-ended" | "Mixed" | null,
-  "wants_subtopics": true | false}}
+  "wants_subtopics": true | false
+  "wants_subtopics": true | false,
+  "objects": true | false}}}}
 
 Rules:
 - Only fill a field if the parent clearly indicated it. Use null otherwise.
 - Match topics loosely: "decimals", "the fraction one", "fractions pls" should all match.
+- "objects" is true only if they are pushing back, hesitating, or asking to change
+  something. Approval, small talk, or anything neutral is false.
 - A bare number like "2" means they picked topic number 2 from a list, not a count.
 - "wants_subtopics" is true only if they asked to narrow down or see subtopics.
 """}], max_tokens=120)
@@ -690,9 +696,26 @@ def handle(phone: str, text: str) -> str:
         if wants_different_child(d, text):
             return offer_children(s)
 
-        ans = parse_yes_no(text)
-        if ans is True:
+        if parse_yes_no(text) is True:      # fast path, no API call
             return generate_and_reply(s)
+
+        topics = d.get("topics") or []
+        req = extract_request(text, topics)
+
+        if req.get("wants_subtopics"):
+            return show_subtopics(s)
+
+        if any(req.get(k) for k in ("topic_id", "difficulty", "count", "type")):
+            apply_request(d, req, topics)
+            return confirm_request_text(d)
+
+        if parse_yes_no(text) is False or req.get("objects"):
+            return ("No problem! What would you like to change? You can say things "
+                    "like \"make it harder\", \"a different topic\", or "
+                    "\"show subtopics\".")
+
+        # Nothing to change and no pushback, so take it as a yes
+        return generate_and_reply(s)
 
         topics = d.get("topics") or []
         req = extract_request(text, topics)
