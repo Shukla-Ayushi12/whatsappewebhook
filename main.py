@@ -556,9 +556,9 @@ def handle(phone: str, text: str) -> str:
         if found and len(found) > 1:
             d["found"] = found
             s["step"] = "pick_student"
-            return ("We found more than one child under this number:\n\n"
+            return ("Hi, welcome back! We found more than one child under this number:\n\n"
                     + format_children(found)
-                    + "\n\nWhich child is this for? Reply with the number.")
+                    + "\n\nWhich child is this for? Reply with the number please.")
 
         return "Hi! Welcome to WhatsPrep.\n\n" + start_registration(s)
 
@@ -792,4 +792,3 @@ async def receive(request: Request, background: BackgroundTasks):
     background.add_task(process, msg["from"], text)
     return {"status": "ok"}
 
-    
