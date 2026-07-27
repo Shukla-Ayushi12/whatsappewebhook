@@ -202,8 +202,8 @@ Available topics:
 Their message: "{text}"
 
 Return ONLY a JSON object, no markdown fences, no explanation:
-{{"topic_id": <id from the list, or null>,
-  "difficulty": "Easy" | "Medium" | "Hard" | null,
+{{""topic_ids": [<ids from the list the parent picked, empty if none>],
+  "difficulty": "Easy 🟢" | "Medium 🟡" | "Hard 🔴" | null,,
   "count": <number of questions, or null>,
   "type": "MCQ" | "Open-ended" | "Mixed" | null,
   "wants_subtopics": true | false,
@@ -212,6 +212,9 @@ Return ONLY a JSON object, no markdown fences, no explanation:
 Rules:
 - Only fill a field if the parent clearly indicated it. Use null otherwise.
 - Match topics loosely: "decimals", "the fraction one", "fractions pls" should all match.
+- topic_ids: include every topic the parent named. "fractions and decimals",
+  "1, 2 and 4", "just fractions" all fill this. Empty list if none named.
+- A bare "2" alone means they picked topic number 2 from a shown list.
 - A bare number like "2" means they picked topic number 2 from a list, not a count.
 - "wants_subtopics" is true only if they asked to narrow down or see subtopics.
 - "objects" is true only if they are pushing back, hesitating, or asking to change
@@ -349,15 +352,14 @@ def get_subtopics(student_id, topic_id: str) -> list | None:
     return None
 
 
-def generate_worksheet_url(student_id, topic_id: str, difficulty: str,
-                           count: int | None = None,
-                           qtype: str | None = None) -> str | None:
+def generate_worksheet_url(student_id, topic_ids, difficulty,
+                           count=None, qtype=None) -> str | None:
     try:
-        sid, tid = int(student_id), int(topic_id)
+        sid = int(student_id)
+        tids = [int(t) for t in topic_ids]
     except (ValueError, TypeError):
         return None
-
-    payload = {"topic_id": tid, "student_id": sid, "difficulty": difficulty}
+    payload = {"topic_ids": tids, "student_id": sid, "difficulty": difficulty}
     if SUPPORTS_QUESTION_OPTIONS:
         if count:
             payload["question_count"] = count
@@ -375,7 +377,7 @@ def generate_worksheet_url(student_id, topic_id: str, difficulty: str,
             d = r.json().get("data", {})
             url = d.get("assessment_url") or d.get("assessment_ur") or d.get("url")
             log.info("Generated worksheet for student %s topic %s: %s",
-                     sid, tid, bool(url))
+                     student_id, topic_ids, bool(url))
             return url
         log.warning("Generate failed: %s %s", r.status_code, r.text)
     except Exception as e:
@@ -468,7 +470,13 @@ def topic_name_for(topics: list, topic_id) -> str:
 
 def confirm_request_text(d: dict) -> str:
     """The single confirmation shown before anything is generated."""
-    label = d.get("subtopic_name") or d.get("topic_name", "that topic")
+    names = d.get("topic_names") or ["that topic"]
+    if d.get("subtopic_name"):
+        label = d["subtopic_name"]
+    elif len(names) == 1:
+        label = names[0]
+    else:
+        label = ", ".join(names[:-1]) + " and " + names[-1]
     lines = [f"Okay great! Generating a practice on {label}, "
              f"{d['difficulty'].lower()} difficulty."]
 
@@ -496,9 +504,9 @@ def prepare_confirmation(s: dict) -> str:
 
 def apply_request(d: dict, req: dict, topics: list) -> None:
     """Merge whatever the parent stated into the pending request."""
-    if req.get("topic_id"):
-        d["topic_id"] = str(req["topic_id"])
-        d["topic_name"] = topic_name_for(topics, req["topic_id"])
+    if req.get("topic_ids"):
+        d["topic_ids"] = [str(t) for t in req["topic_ids"]]
+        d["topic_names"] = [topic_name_for(topics, t) for t in req["topic_ids"]]
         d.pop("subtopic_id", None)
         d.pop("subtopic_name", None)
     if req.get("difficulty"):
@@ -525,24 +533,18 @@ def offer_children(s: dict) -> str:
 
 def generate_and_reply(s: dict) -> str:
     d = s["data"]
-    target = d.get("subtopic_id") or d.get("topic_id")
+    ids = [d["subtopic_id"]] if d.get("subtopic_id") else d.get("topic_ids", [])
     url = generate_worksheet_url(
-        d.get("student_id"), str(target).strip(), d["difficulty"],
+        d.get("student_id"), ids, d["difficulty"],
         count=d.get("count"), qtype=d.get("type"),
     )
-
-    # Clear the pending request but keep the child's profile for the next round
-    for k in ("topic_id", "topic_name", "subtopic_id", "subtopic_name",
+    for k in ("topic_ids", "topic_names", "subtopic_id", "subtopic_name",
               "difficulty", "count", "type", "subtopics"):
         d.pop(k, None)
     s["step"] = "menu"
-
     if not url:
-        return ("Sorry, I couldn't generate that worksheet just now. "
-                "Please try again in a moment.")
-    return (f"Here's the practice, ready to go!\n\n{url}\n\n"
-            f"Anything else I can help with?")
-
+        return "Sorry, I couldn't generate that just now. Please try again in a moment."
+    return f"Here's the practice, ready to go!\n\n{url}\n\nAnything else I can help with?"
 
 # ---------------------------------------------------------------- main handler
 def handle(phone: str, text: str) -> str:
@@ -666,10 +668,10 @@ def _route(s: dict, d: dict, step: str, phone: str, text: str) -> str:
         req = extract_request(text, topics)
         apply_request(d, req, topics)
 
-        if req.get("wants_subtopics") and d.get("topic_id"):
+        if req.get("wants_subtopics") and d.get("topic_ids"):
             return show_subtopics(s)
 
-        if not d.get("topic_id"):
+        if not d.get("topic_ids"):
             s["step"] = "topic"
             return (f"Here's what {d.get('name', 'your child')} can practise:\n\n"
                     f"{format_topics(topics)}\n\n"
@@ -686,21 +688,24 @@ def _route(s: dict, d: dict, step: str, phone: str, text: str) -> str:
         topics = d.get("topics") or []
 
         raw = text.strip()
-        if raw.isdigit():
-            i = int(raw) - 1
-            if not (0 <= i < len(topics)):
-                return f"Please pick a number between 1 and {len(topics)}."
-            d["topic_id"] = str(topics[i].get("topic_id", ""))
-            d["topic_name"] = topics[i].get("topic_name", "")
+        nums = re.split(r"[,\s]+", raw)
+        if all(n.isdigit() for n in nums if n):
+            picked = []
+            for n in nums:
+                if not n:
+                    continue
+                i = int(n) - 1
+                if not (0 <= i < len(topics)):
+                    return f"Please pick numbers between 1 and {len(topics)}."
+                picked.append(topics[i])
+            d["topic_ids"] = [str(t.get("topic_id", "")) for t in picked]
+            d["topic_names"] = [t.get("topic_name", "") for t in picked]
         else:
             req = extract_request(text, topics)
             apply_request(d, req, topics)
-            if req.get("wants_subtopics") and d.get("topic_id"):
-                return show_subtopics(s)
-            if not d.get("topic_id"):
-                return ("I didn't catch which topic you meant. You can reply with "
-                        f"a number from 1 to {len(topics)}, or name the topic.")
-
+            if not d.get("topic_ids"):
+                return ("I didn't catch which topic(s). Reply with numbers like "
+                        f"\"1\" or \"1, 3\", or name them.")
         return prepare_confirmation(s)
 
     # ---------- optional subtopic narrowing
@@ -753,7 +758,7 @@ def _route(s: dict, d: dict, step: str, phone: str, text: str) -> str:
 def show_subtopics(s: dict) -> str:
     """Only reached when a parent asks to narrow down, never forced on them."""
     d = s["data"]
-    subs = get_subtopics(d.get("student_id"), d.get("topic_id"))
+    subs = get_subtopics(d.get("student_id"), d.get("topic_ids"))
     if not subs:
         return ("I couldn't load subtopics for that one, so we'll use the broad "
                 "topic.\n\n" + prepare_confirmation(s))
