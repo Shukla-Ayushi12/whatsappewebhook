@@ -8,6 +8,7 @@ advances one step. Run: uvicorn main:app --host 0.0.0.0 --port $PORT
 import os
 import re
 import json
+import logging
 import httpx
 import requests
 from datetime import datetime
@@ -20,6 +21,14 @@ from student_registry import StudentRegistry
 
 load_dotenv()
 app = FastAPI()
+
+# ---------------------------------------------------------------- logging
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+log = logging.getLogger("whatsprep")
 
 # ---------------------------------------------------------------- config
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
@@ -92,7 +101,7 @@ async def send_message(to: str, text: str):
             },
         )
         if r.status_code != 200:
-            print("Send failed:", r.status_code, r.text)
+            log.warning("Send failed: %s %s", r.status_code, r.text)
 
 
 # ---------------------------------------------------------------- llm helpers
@@ -103,7 +112,7 @@ def call_llm(messages: list, max_tokens: int = 50) -> str:
         )
         return resp.choices[0].message.content.strip()
     except Exception as e:
-        print(f"LLM error: {e}")
+        log.error("LLM error: %s", e)
         return ""
 
 
@@ -135,9 +144,10 @@ Return ONLY "yes" or "no".
 YES = {"yes", "y", "yup", "yeah", "yea", "ya", "yep", "yah", "sure", "ok", "okay",
        "okok", "correct", "right", "true", "confirm", "confirmed", "that's right",
        "thats right", "yes please", "correct la", "can", "go ahead", "please",
-       "sounds good", "perfect", "great", "\U0001F44D", "\u2705","looks good", "lgtm", "go", "do it", "make it", "send it", "send",
-       "alright", "cool", "fine", "good", "nice", "yes pls", "shoot",
-       "let's go", "lets go", "start", "generate", "\U0001F64F",}
+       "sounds good", "perfect", "great", "looks good", "lgtm", "go", "do it",
+       "make it", "send it", "send", "alright", "cool", "fine", "good", "nice",
+       "yes pls", "shoot", "let's go", "lets go", "start", "generate",
+       "\U0001F44D", "\u2705", "\U0001F64F"}
 
 NO = {"no", "n", "nope", "nah", "naw", "not", "wrong", "incorrect", "false",
       "not really", "no lah", "cannot", "\u274C"}
@@ -196,17 +206,16 @@ Return ONLY a JSON object, no markdown fences, no explanation:
   "difficulty": "Easy" | "Medium" | "Hard" | null,
   "count": <number of questions, or null>,
   "type": "MCQ" | "Open-ended" | "Mixed" | null,
-  "wants_subtopics": true | false
   "wants_subtopics": true | false,
-  "objects": true | false}}}}
+  "objects": true | false}}
 
 Rules:
 - Only fill a field if the parent clearly indicated it. Use null otherwise.
 - Match topics loosely: "decimals", "the fraction one", "fractions pls" should all match.
-- "objects" is true only if they are pushing back, hesitating, or asking to change
-  something. Approval, small talk, or anything neutral is false.
 - A bare number like "2" means they picked topic number 2 from a list, not a count.
 - "wants_subtopics" is true only if they asked to narrow down or see subtopics.
+- "objects" is true only if they are pushing back, hesitating, or asking to change
+  something. Approval, small talk, or anything neutral is false.
 """}], max_tokens=120)
 
     raw = (r or "").strip()
@@ -217,7 +226,7 @@ Rules:
         data = json.loads(raw)
         return data if isinstance(data, dict) else {}
     except Exception:
-        print(f"extract_request could not parse: {raw!r}")
+        log.warning("extract_request could not parse: %r", raw)
         return {}
 
 
@@ -263,7 +272,8 @@ def load_database() -> list:
             return []
         with open(DB_FILE) as f:
             return json.load(f)
-    except Exception:
+    except Exception as e:
+        log.error("Local db read error: %s", e)
         return []
 
 
@@ -297,7 +307,7 @@ def get_topics(student_id, subject: str = "Math") -> list | None:
     try:
         sid = int(student_id)
     except (ValueError, TypeError):
-        print(f"Student not on platform: {student_id}")
+        log.info("Student not on platform: %s", student_id)
         return None
 
     subject_map = {"Math": "Mathematics", "Science": "Science", "English": "English"}
@@ -309,10 +319,13 @@ def get_topics(student_id, subject: str = "Math") -> list | None:
             timeout=10,
         )
         if r.status_code == 200:
-            return r.json().get("data") or None
-        print(f"Topics failed: {r.status_code} {r.text}")
+            topics = r.json().get("data") or None
+            log.info("Topics loaded: %s for student %s",
+                     len(topics) if topics else 0, sid)
+            return topics
+        log.warning("Topics failed: %s %s", r.status_code, r.text)
     except Exception as e:
-        print(f"Topics error: {e}")
+        log.error("Topics error: %s", e)
     return None
 
 
@@ -330,8 +343,9 @@ def get_subtopics(student_id, topic_id: str) -> list | None:
         )
         if r.status_code == 200:
             return r.json().get("data") or None
+        log.warning("Subtopics failed: %s %s", r.status_code, r.text)
     except Exception as e:
-        print(f"Subtopics error: {e}")
+        log.error("Subtopics error: %s", e)
     return None
 
 
@@ -359,10 +373,13 @@ def generate_worksheet_url(student_id, topic_id: str, difficulty: str,
         )
         if r.status_code == 200:
             d = r.json().get("data", {})
-            return d.get("assessment_url") or d.get("assessment_ur") or d.get("url")
-        print(f"Generate failed: {r.status_code} {r.text}")
+            url = d.get("assessment_url") or d.get("assessment_ur") or d.get("url")
+            log.info("Generated worksheet for student %s topic %s: %s",
+                     sid, tid, bool(url))
+            return url
+        log.warning("Generate failed: %s %s", r.status_code, r.text)
     except Exception as e:
-        print(f"Generate error: {e}")
+        log.error("Generate error: %s", e)
     return None
 
 
@@ -428,6 +445,7 @@ def do_register(s: dict) -> str:
     save_student_local(d["name"], d["level"], d["gender"], d["phone"], student_id)
     d["student_id"] = student_id
     s["step"] = "menu"
+    log.info("Registered new student %s (%s)", d["name"], student_id)
     return (f"{d['name']} has been registered with WhatsPrep.\n"
             f"Student ID: {student_id}\n\n{menu_prompt(d['name'])}")
 
@@ -531,7 +549,15 @@ def handle(phone: str, text: str) -> str:
     s = session_for(phone)
     d = s["data"]
     step = s["step"]
+    log.info("IN  %s step=%s text=%r", phone[-4:], step, text[:80])
 
+    reply = _route(s, d, step, phone, text)
+
+    log.info("OUT %s step=%s", phone[-4:], s["step"])
+    return reply
+
+
+def _route(s: dict, d: dict, step: str, phone: str, text: str) -> str:
     # Global exit, valid at any step except when we're asking for a name
     if step not in ("reg_name",) and is_finished(text, at_menu=(step == "menu")):
         name = d.get("name", "")
@@ -562,9 +588,9 @@ def handle(phone: str, text: str) -> str:
         if found and len(found) > 1:
             d["found"] = found
             s["step"] = "pick_student"
-            return ("Hi, welcome back! We found more than one child under this number:\n\n"
+            return ("We found more than one child under this number:\n\n"
                     + format_children(found)
-                    + "\n\nWhich child is this for? Reply with the number please.")
+                    + "\n\nWhich child is this for? Reply with the number.")
 
         return "Hi! Welcome to WhatsPrep.\n\n" + start_registration(s)
 
@@ -691,12 +717,13 @@ def handle(phone: str, text: str) -> str:
         # Anything else, treat as "just use the broad topic"
         return prepare_confirmation(s)
 
-    # ---------- the single confirmation before generating
+    # ---------- the single confirmation before generating.
+    # Defaults toward generating: only a clear change request or a clear no holds it.
     if step == "confirm_request":
         if wants_different_child(d, text):
             return offer_children(s)
 
-        if parse_yes_no(text) is True:      # fast path, no API call
+        if parse_yes_no(text) is True:          # fast local yes, no API call
             return generate_and_reply(s)
 
         topics = d.get("topics") or []
@@ -716,28 +743,6 @@ def handle(phone: str, text: str) -> str:
 
         # Nothing to change and no pushback, so take it as a yes
         return generate_and_reply(s)
-
-        topics = d.get("topics") or []
-        req = extract_request(text, topics)
-
-        if req.get("wants_subtopics"):
-            return show_subtopics(s)
-
-        if any(req.get(k) for k in ("topic_id", "difficulty", "count", "type")):
-            apply_request(d, req, topics)
-            return confirm_request_text(d)
-
-        if ans is False:
-            return ("No problem! What would you like to change? You can say things "
-                    "like \"make it harder\", \"a different topic\", or "
-                    "\"show subtopics\".")
-
-        # Fall back to the slower classifier only when nothing else matched
-        if ai_yes_no(text) is True:
-            return generate_and_reply(s)
-
-        return ("Sorry, I didn't quite catch that. Say \"go ahead\" and I'll make it, "
-                "or tell me what to change.")
 
     # ---------- fallback
     s["step"] = "menu"
@@ -775,7 +780,7 @@ def process(phone: str, text: str):
     try:
         reply = handle(phone, text)
     except Exception as e:
-        print(f"Handler error: {e}")
+        log.error("Handler error: %s", e)
         reply = "Something went wrong on our end. Please try again."
     asyncio.run(send_message(phone, reply))
 
@@ -791,8 +796,8 @@ async def receive(request: Request, background: BackgroundTasks):
 
     # Delivery / read receipts for messages we sent
     for st in value.get("statuses", []):
-        print(f"STATUS {st.get('status')} -> {st.get('recipient_id')} "
-              f"({st.get('id')}) {st.get('errors', '')}")
+        log.info("STATUS %s -> %s (%s) %s", st.get("status"),
+                 st.get("recipient_id"), st.get("id"), st.get("errors", ""))
 
     msgs = value.get("messages", [])
     if not msgs:
@@ -815,3 +820,4 @@ async def receive(request: Request, background: BackgroundTasks):
     background.add_task(process, msg["from"], text)
     return {"status": "ok"}
 
+    
