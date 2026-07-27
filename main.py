@@ -383,7 +383,7 @@ def generate_worksheet_url(student_id, topic_id: str, difficulty: str,
     return None
 
 
-# ---------------------------------------------------------------- flow helpers
+# ---------------------------------------------------------------- 
 def session_for(phone: str) -> dict:
     if phone not in SESSIONS:
         SESSIONS[phone] = {"step": "start", "data": {}}
@@ -439,6 +439,7 @@ def confirm_details_text(d: dict) -> str:
 def do_register(s: dict) -> str:
     d = s["data"]
     new = registry.register_student(d["name"], d["level"], d["gender"], d["phone"])
+    log.info("register_student returned: %s", new)   
     student_id = (new or {}).get(
         "student_id", f"S{datetime.now().strftime('%Y%m%d%H%M%S')}"
     )
