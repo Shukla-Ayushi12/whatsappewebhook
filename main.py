@@ -69,6 +69,9 @@ LEVEL_DEFAULTS = {
     "Primary 6": {"count": 25, "type": "Open-ended"},
 }
 
+# Emoji shown next to each difficulty in messages (kept out of the stored value)
+DIFFICULTY_EMOJI = {"Easy": "\U0001F7E2", "Medium": "\U0001F7E1", "Hard": "\U0001F534"}
+
 # Phrases that suggest the parent wants a different child than the one we picked
 SWITCH_HINTS = ("wrong", "different child", "another child", "not ", "switch",
                 "other kid", "other child", "my other")
@@ -202,20 +205,20 @@ Available topics:
 Their message: "{text}"
 
 Return ONLY a JSON object, no markdown fences, no explanation:
-{{""topic_ids": [<ids from the list the parent picked, empty if none>],
-  "difficulty": "Easy 🟢" | "Medium 🟡" | "Hard 🔴" | null,,
+{{"topic_ids": [<ids from the list the parent picked, empty if none>],
+  "difficulty": "Easy" | "Medium" | "Hard" | null,
   "count": <number of questions, or null>,
   "type": "MCQ" | "Open-ended" | "Mixed" | null,
   "wants_subtopics": true | false,
   "objects": true | false}}
 
 Rules:
-- Only fill a field if the parent clearly indicated it. Use null otherwise.
-- Match topics loosely: "decimals", "the fraction one", "fractions pls" should all match.
-- topic_ids: include every topic the parent named. "fractions and decimals",
-  "1, 2 and 4", "just fractions" all fill this. Empty list if none named.
-- A bare "2" alone means they picked topic number 2 from a shown list.
-- A bare number like "2" means they picked topic number 2 from a list, not a count.
+- Only fill a field if the parent clearly indicated it. Use null (or an empty list) otherwise.
+- topic_ids: include EVERY topic the parent named. "fractions and decimals",
+  "1, 2 and 4", "just fractions", "add whole numbers too" all fill this.
+  Match loosely: "decimals", "the fraction one", "fractions pls" all match.
+  Use an empty list if they named no topic.
+- A bare number like "2" alone means they picked topic number 2 from a shown list.
 - "wants_subtopics" is true only if they asked to narrow down or see subtopics.
 - "objects" is true only if they are pushing back, hesitating, or asking to change
   something. Approval, small talk, or anything neutral is false.
@@ -332,7 +335,7 @@ def get_topics(student_id, subject: str = "Math") -> list | None:
     return None
 
 
-def get_subtopics(student_id, topic_id: str) -> list | None:
+def get_subtopics(student_id, topic_id) -> list | None:
     try:
         sid, tid = int(student_id), int(topic_id)
     except (ValueError, TypeError):
@@ -354,11 +357,13 @@ def get_subtopics(student_id, topic_id: str) -> list | None:
 
 def generate_worksheet_url(student_id, topic_ids, difficulty,
                            count=None, qtype=None) -> str | None:
+    """One call, one combined paper. Sends topic_ids as a list of ints."""
     try:
         sid = int(student_id)
         tids = [int(t) for t in topic_ids]
     except (ValueError, TypeError):
         return None
+
     payload = {"topic_ids": tids, "student_id": sid, "difficulty": difficulty}
     if SUPPORTS_QUESTION_OPTIONS:
         if count:
@@ -376,8 +381,8 @@ def generate_worksheet_url(student_id, topic_ids, difficulty,
         if r.status_code == 200:
             d = r.json().get("data", {})
             url = d.get("assessment_url") or d.get("assessment_ur") or d.get("url")
-            log.info("Generated worksheet for student %s topic %s: %s",
-                     student_id, topic_ids, bool(url))
+            log.info("Generated worksheet for student %s topics %s: %s",
+                     sid, tids, bool(url))
             return url
         log.warning("Generate failed: %s %s", r.status_code, r.text)
     except Exception as e:
@@ -385,7 +390,7 @@ def generate_worksheet_url(student_id, topic_ids, difficulty,
     return None
 
 
-# ---------------------------------------------------------------- 
+# ---------------------------------------------------------------- flow helpers
 def session_for(phone: str) -> dict:
     if phone not in SESSIONS:
         SESSIONS[phone] = {"step": "start", "data": {}}
@@ -401,7 +406,7 @@ def adopt_student(d: dict, c: dict) -> None:
         "student_id": c.get("student_id", ""),
     })
     # A different child means a fresh topic list and a fresh request
-    for k in ("topics", "topic_id", "topic_name", "subtopic_id", "subtopic_name",
+    for k in ("topics", "topic_ids", "topic_names", "subtopic_id", "subtopic_name",
               "subtopics", "difficulty", "count", "type"):
         d.pop(k, None)
 
@@ -421,7 +426,8 @@ def format_children(found: list) -> str:
 
 def menu_prompt(name: str) -> str:
     return (f"How can I help {name} today?\n\n"
-            f"Just tell me what you'd like, e.g. \"easy fractions practice\".")
+            f"Just tell me what you'd like, e.g. \"easy fractions practice\". "
+            f"You can pick more than one topic too.")
 
 
 def start_registration(s: dict) -> str:
@@ -441,7 +447,7 @@ def confirm_details_text(d: dict) -> str:
 def do_register(s: dict) -> str:
     d = s["data"]
     new = registry.register_student(d["name"], d["level"], d["gender"], d["phone"])
-    log.info("register_student returned: %s", new)   
+    log.info("register_student returned: %s", new)
     student_id = (new or {}).get(
         "student_id", f"S{datetime.now().strftime('%Y%m%d%H%M%S')}"
     )
@@ -468,17 +474,26 @@ def topic_name_for(topics: list, topic_id) -> str:
     return "that topic"
 
 
+def join_names(names: list) -> str:
+    """'Fractions', 'Fractions and Decimals', 'A, B and C'."""
+    names = [n for n in names if n]
+    if not names:
+        return "that topic"
+    if len(names) == 1:
+        return names[0]
+    return ", ".join(names[:-1]) + " and " + names[-1]
+
+
 def confirm_request_text(d: dict) -> str:
     """The single confirmation shown before anything is generated."""
-    names = d.get("topic_names") or ["that topic"]
     if d.get("subtopic_name"):
         label = d["subtopic_name"]
-    elif len(names) == 1:
-        label = names[0]
     else:
-        label = ", ".join(names[:-1]) + " and " + names[-1]
+        label = join_names(d.get("topic_names") or [])
+
+    emoji = DIFFICULTY_EMOJI.get(d["difficulty"], "")
     lines = [f"Okay great! Generating a practice on {label}, "
-             f"{d['difficulty'].lower()} difficulty."]
+             f"{d['difficulty'].lower()} {emoji} difficulty."]
 
     if SUPPORTS_QUESTION_OPTIONS:
         lines.append(f"\nI'll put together {d['count']} {d['type'].lower()} questions, "
@@ -507,6 +522,7 @@ def apply_request(d: dict, req: dict, topics: list) -> None:
     if req.get("topic_ids"):
         d["topic_ids"] = [str(t) for t in req["topic_ids"]]
         d["topic_names"] = [topic_name_for(topics, t) for t in req["topic_ids"]]
+        # A topic change invalidates any previously chosen subtopic
         d.pop("subtopic_id", None)
         d.pop("subtopic_name", None)
     if req.get("difficulty"):
@@ -538,13 +554,16 @@ def generate_and_reply(s: dict) -> str:
         d.get("student_id"), ids, d["difficulty"],
         count=d.get("count"), qtype=d.get("type"),
     )
+    # Clear the pending request but keep the child's profile for the next round
     for k in ("topic_ids", "topic_names", "subtopic_id", "subtopic_name",
               "difficulty", "count", "type", "subtopics"):
         d.pop(k, None)
     s["step"] = "menu"
+
     if not url:
         return "Sorry, I couldn't generate that just now. Please try again in a moment."
     return f"Here's the practice, ready to go!\n\n{url}\n\nAnything else I can help with?"
+
 
 # ---------------------------------------------------------------- main handler
 def handle(phone: str, text: str) -> str:
@@ -675,25 +694,22 @@ def _route(s: dict, d: dict, step: str, phone: str, text: str) -> str:
             s["step"] = "topic"
             return (f"Here's what {d.get('name', 'your child')} can practise:\n\n"
                     f"{format_topics(topics)}\n\n"
-                    f"Just tell me which one, or say something like "
-                    f"\"easy fractions\".")
+                    f"Tell me which one(s) — a number like \"1\", several like "
+                    f"\"1, 3\", or just name them, e.g. \"easy fractions\".")
 
         return prepare_confirmation(s)
 
-    # ---------- topic selection, accepting a number or free text
+    # ---------- topic selection, accepting one or several numbers or free text
     if step == "topic":
         if wants_different_child(d, text):
             return offer_children(s)
 
         topics = d.get("topics") or []
+        nums = [n for n in re.split(r"[,\s]+", text.strip()) if n]
 
-        raw = text.strip()
-        nums = re.split(r"[,\s]+", raw)
-        if all(n.isdigit() for n in nums if n):
+        if nums and all(n.isdigit() for n in nums):
             picked = []
             for n in nums:
-                if not n:
-                    continue
                 i = int(n) - 1
                 if not (0 <= i < len(topics)):
                     return f"Please pick numbers between 1 and {len(topics)}."
@@ -703,12 +719,15 @@ def _route(s: dict, d: dict, step: str, phone: str, text: str) -> str:
         else:
             req = extract_request(text, topics)
             apply_request(d, req, topics)
+            if req.get("wants_subtopics") and d.get("topic_ids"):
+                return show_subtopics(s)
             if not d.get("topic_ids"):
-                return ("I didn't catch which topic(s). Reply with numbers like "
-                        f"\"1\" or \"1, 3\", or name them.")
+                return ("I didn't catch which topic(s) you meant. Reply with numbers "
+                        f"like \"1\" or \"1, 3\", or name them.")
+
         return prepare_confirmation(s)
 
-    # ---------- optional subtopic narrowing
+    # ---------- optional subtopic narrowing (single topic only)
     if step == "subtopic_pick":
         subs = d.get("subtopics") or []
         raw = text.strip()
@@ -738,13 +757,14 @@ def _route(s: dict, d: dict, step: str, phone: str, text: str) -> str:
         if req.get("wants_subtopics"):
             return show_subtopics(s)
 
-        if any(req.get(k) for k in ("topic_id", "difficulty", "count", "type")):
+        # A topic/difficulty/count/type change at confirmation: apply and re-confirm
+        if any(req.get(k) for k in ("topic_ids", "difficulty", "count", "type")):
             apply_request(d, req, topics)
             return confirm_request_text(d)
 
         if parse_yes_no(text) is False or req.get("objects"):
             return ("No problem! What would you like to change? You can say things "
-                    "like \"make it harder\", \"a different topic\", or "
+                    "like \"make it harder\", \"add another topic\", or "
                     "\"show subtopics\".")
 
         # Nothing to change and no pushback, so take it as a yes
@@ -756,17 +776,27 @@ def _route(s: dict, d: dict, step: str, phone: str, text: str) -> str:
 
 
 def show_subtopics(s: dict) -> str:
-    """Only reached when a parent asks to narrow down, never forced on them."""
+    """Only reached when a parent asks to narrow down. Single topic only."""
     d = s["data"]
-    subs = get_subtopics(d.get("student_id"), d.get("topic_ids"))
+    ids = d.get("topic_ids") or []
+    names = d.get("topic_names") or []
+
+    # Subtopics only make sense for one topic. With several, use broad topics.
+    if len(ids) != 1:
+        return ("Subtopics only work with a single topic, so I'll use the broad "
+                "topics for these.\n\n" + prepare_confirmation(s))
+
+    subs = get_subtopics(d.get("student_id"), ids[0])
     if not subs:
         return ("I couldn't load subtopics for that one, so we'll use the broad "
                 "topic.\n\n" + prepare_confirmation(s))
+
     d["subtopics"] = subs
     s["step"] = "subtopic_pick"
     lines = [f"{i}. {sub.get('subtopic_name', sub.get('name', f'Subtopic {i}'))}"
              for i, sub in enumerate(subs, 1)]
-    return (f"Subtopics under {d.get('topic_name', 'that topic')}:\n\n"
+    topic_label = names[0] if names else "that topic"
+    return (f"Subtopics under {topic_label}:\n\n"
             + "\n".join(lines)
             + "\n\nReply with a number, or say \"broad topic is fine\".")
 
