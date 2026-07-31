@@ -4,6 +4,7 @@ import hmac
 import hashlib
 import asyncio
 import logging
+import re
 from datetime import datetime
 
 import httpx
@@ -219,6 +220,29 @@ def _generate_worksheet_url(student_id, topic_ids, difficulty,
     return None
 
 
+# ---------------------------------------------------------------- reply cleanup
+_MD_LINK = re.compile(r"\[([^\]]+)\]\(\s*(https?://[^\s)]+)\s*\)")
+_BARE_LINK = re.compile(r"https?://\S*whatsprep\.com\S*")
+
+
+def clean_reply(text: str) -> str:
+    """Strip practice links out of the model's prose.
+
+    The link is sent as its own message so WhatsApp renders a preview card.
+    If the model also writes it into its text the parent sees it twice, and
+    markdown link syntax shows up literally because WhatsApp does not render
+    it. The prompt asks the model not to do this; this is the safety net.
+    """
+    if not text:
+        return text
+    text = _MD_LINK.sub(r"\1", text)
+    text = _BARE_LINK.sub("", text)
+    text = re.sub(r"\(\s*\)", "", text)
+    text = re.sub(r"[ \t]{2,}", " ", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
+
+
 # ---------------------------------------------------------------- session
 def session_for(phone: str) -> dict:
     if phone not in SESSIONS:
@@ -235,6 +259,20 @@ offer or discuss other subjects.
 HOW THE PRODUCT WORKS
 You do not send questions in the chat. You generate a practice set and send \
 back a link the child opens. Never write maths questions yourself.
+
+NEVER WRITE THE LINK IN YOUR MESSAGE
+The system sends the practice link automatically as a separate message right \
+after yours. If you also paste it, the parent gets it twice. Say something \
+like "Here's Ayu's practice on Angles, medium difficulty" and stop. Do not \
+write the URL, do not write markdown links like [text](url), and never say \
+"click here" followed by a link. WhatsApp shows markdown literally, so never \
+use square brackets, asterisks or backticks anywhere.
+
+ONE PAPER, ALL TOPICS
+If a parent asks for several topics, pass them ALL in a single \
+create_practice call as one topic_ids list. The platform combines them into \
+one paper. Never call create_practice more than once for the same request, \
+it produces several separate papers and several links.
 
 ASK AS FEW QUESTIONS AS POSSIBLE
 Read everything the parent gave you in one message and act on it. \
@@ -347,7 +385,9 @@ TOOLS = [
                         "are set by the system."),
         "parameters": {"type": "object", "properties": {
             "topic_ids": {"type": "array", "items": {"type": "string"},
-                          "description": "One or more topic_ids from list_topics"},
+                          "description": ("ALL requested topic_ids from list_topics, in "
+                                          "one list. e.g. topics 2, 5 and 6 becomes "
+                                          "[\"2\",\"5\",\"6\"], not three calls.")},
             "subtopic_id": {"type": "string",
                             "description": "Optional, only if one was chosen"},
             "difficulty": {"type": "string", "enum": ["Easy", "Medium", "Hard"]}},
@@ -594,7 +634,7 @@ async def agent_turn(phone: str, text: str) -> None:
     history.append({"role": "user", "content": text})
     log.info("IN  %s %r", phone[-4:], text[:80])
 
-    sent_link = False
+    pending_links: list[str] = []
 
     for hop in range(MAX_TOOL_HOPS):
         try:
@@ -615,7 +655,11 @@ async def agent_turn(phone: str, text: str) -> None:
 
         if not msg.tool_calls:
             if msg.content:
-                await send_message(phone, msg.content)
+                await send_message(phone, clean_reply(msg.content))
+            # Link last, so the preview card sits under the explanation
+            for link in pending_links:
+                await send_message(phone, link)
+            pending_links.clear()
             break
 
         for call in msg.tool_calls:
@@ -624,16 +668,18 @@ async def agent_turn(phone: str, text: str) -> None:
             except json.JSONDecodeError:
                 args = {}
             result = await run_tool(call.function.name, args, s, phone)
-            log.info("TOOL %s -> %s", call.function.name,
-                     list(result)[:4])
+            log.info("TOOL %s -> %s", call.function.name, list(result)[:4])
             history.append({"role": "tool", "tool_call_id": call.id,
                             "content": json.dumps(result)})
 
-            # Send the link on its own so WhatsApp renders a preview
-            if call.function.name == "create_practice" and result.get("link"):
-                await send_message(phone, result["link"])
-                sent_link = True
+            link = result.get("link")
+            if call.function.name == "create_practice" and link:
+                if link not in pending_links:
+                    pending_links.append(link)
     else:
+        for link in pending_links:
+            await send_message(phone, link)
+        pending_links.clear()
         await send_message(phone, "Sorry, I got a bit stuck there. "
                                   "Could you tell me that again?")
 
@@ -642,7 +688,7 @@ async def agent_turn(phone: str, text: str) -> None:
     if s.get("_end"):
         SESSIONS.pop(phone, None)
 
-    log.info("OUT %s link=%s", phone[-4:], sent_link)
+    log.info("OUT %s", phone[-4:])
 
 
 # ---------------------------------------------------------------- webhook
@@ -712,4 +758,3 @@ async def receive(request: Request, background: BackgroundTasks):
             background.add_task(agent_turn, msg["from"], text)
 
     return {"status": "ok"}
-
