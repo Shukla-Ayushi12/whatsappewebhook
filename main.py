@@ -260,13 +260,13 @@ HOW THE PRODUCT WORKS
 You do not send questions in the chat. You generate a practice set and send \
 back a link the child opens. Never write maths questions yourself.
 
-NEVER WRITE THE LINK IN YOUR MESSAGE
-The system sends the practice link automatically as a separate message right \
-after yours. If you also paste it, the parent gets it twice. Say something \
-like "Here's Ayu's practice on Angles, medium difficulty" and stop. Do not \
-write the URL, do not write markdown links like [text](url), and never say \
-"click here" followed by a link. WhatsApp shows markdown literally, so never \
-use square brackets, asterisks or backticks anywhere.
+NEVER WRITE THE LINK YOURSELF
+The system appends the practice link to the end of your own message \
+automatically. If you also paste it, the parent gets it twice. Write one \
+short line like "Here's Ayu's practice on Angles, medium difficulty" and \
+stop. Do not write the URL, do not write markdown links like [text](url), \
+and do not end with "here:" or "click this". WhatsApp shows markdown \
+literally, so never use square brackets, asterisks or backticks anywhere.
 
 ONE PAPER, ALL TOPICS
 If a parent asks for several topics, pass them ALL in a single \
@@ -654,11 +654,13 @@ async def agent_turn(phone: str, text: str) -> None:
         history.append(msg.model_dump(exclude_none=True))
 
         if not msg.tool_calls:
-            if msg.content:
-                await send_message(phone, clean_reply(msg.content))
-            # Link last, so the preview card sits under the explanation
-            for link in pending_links:
-                await send_message(phone, link)
+            # One message: the model's line, then the link on its own row.
+            # WhatsApp renders the preview card from the URL in the same bubble.
+            body = clean_reply(msg.content or "")
+            if pending_links:
+                body = (body + "\n\n" + "\n".join(pending_links)).strip()
+            if body:
+                await send_message(phone, body)
             pending_links.clear()
             break
 
@@ -677,11 +679,12 @@ async def agent_turn(phone: str, text: str) -> None:
                 if link not in pending_links:
                     pending_links.append(link)
     else:
-        for link in pending_links:
-            await send_message(phone, link)
+        # Ran out of tool hops without a final reply. Still hand over any link.
+        body = "Sorry, I got a bit stuck there. Could you tell me that again?"
+        if pending_links:
+            body = ("Here's the practice.\n\n" + "\n".join(pending_links))
         pending_links.clear()
-        await send_message(phone, "Sorry, I got a bit stuck there. "
-                                  "Could you tell me that again?")
+        await send_message(phone, body)
 
     s["messages"] = history[-MAX_HISTORY:]
 
@@ -758,3 +761,4 @@ async def receive(request: Request, background: BackgroundTasks):
             background.add_task(agent_turn, msg["from"], text)
 
     return {"status": "ok"}
+
