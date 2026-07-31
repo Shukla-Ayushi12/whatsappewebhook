@@ -1,3 +1,14 @@
+"""
+WhatsPrep WhatsApp webhook — agent version.
+
+Replaces the step machine with an LLM agent loop. The model drives the
+conversation; your platform API calls are exposed to it as tools. All
+invariants (which child, which phone, question count/type) stay enforced
+in Python, never delegated to the model.
+
+Run: uvicorn main:app --host 0.0.0.0 --port $PORT
+"""
+
 import os
 import json
 import hmac
@@ -42,7 +53,9 @@ registry = StudentRegistry(
 
 DB_FILE = "students.json"
 
-
+# Set True once /generate-assessment is confirmed to accept question_count
+# and question_type. While False the bot still picks values internally but
+# does not promise them to the parent.
 SUPPORTS_QUESTION_OPTIONS = False
 
 LEVEL_DEFAULTS = {
@@ -138,6 +151,8 @@ def usable_student_id(student_id) -> bool:
 
 
 # ---------------------------------------------------------------- platform api
+# Unchanged from your version. Sync `requests` calls are wrapped in
+# asyncio.to_thread at the call site so they don't block the event loop.
 def _get_topics(student_id, subject: str = "Math") -> list | None:
     try:
         sid = int(student_id)
@@ -258,6 +273,30 @@ no markdown, no bullet characters, no headings. Many parents are not \
 tech-savvy. One or two short messages, never a wall of text. When you list \
 topics, number them so a parent can reply with a number.
 
+OFF-TOPIC AND SMALL TALK
+Reply like a person would: answer briefly and honestly, then offer what you \
+can actually do. Never fall back on a canned "I didn't catch that" when the \
+message was perfectly clear and simply not about practice.
+  "what's the time right now?"
+    -> "I can't check the time I'm afraid, but I can get some Maths practice
+        going for Ayu whenever you're ready."
+  "how are you?"
+    -> "Doing well, thanks! What should Ayu work on today?"
+  "can you help with science?"
+    -> "Only Maths at the moment, sorry. Want me to set up some Maths
+        practice instead?"
+Never claim an ability you do not have. You cannot browse, check the time, \
+send reminders, or see the child's homework. Say so plainly and move on.
+
+ADDING ANOTHER CHILD
+If a parent asks to add a student, they want to register another child. Ask \
+for the name, level and gender in one message, then call register_child. Do \
+not show them a topic list.
+
+ASKING AGAIN
+Only say you did not understand when you genuinely did not. If a parent \
+says something unrelated, respond to what they actually said.
+
 WHEN A TOOL RETURNS AN ERROR
 Never invent a result and never carry on as if it worked. Each error carries \
 a "message" telling you what to do; follow it. In particular, if a lookup or \
@@ -334,6 +373,8 @@ TOOLS = [
 
 
 # ---------------------------------------------------------------- tool impls
+# Every tool reads the phone and active child from the session, never from
+# model arguments. The model cannot address another parent's children.
 
 async def t_find_children(s: dict, phone: str) -> dict:
     local = phone[2:] if phone.startswith("65") else phone
@@ -342,6 +383,8 @@ async def t_find_children(s: dict, phone: str) -> dict:
     found = await asyncio.to_thread(registry.check_student_exists, local)
     err = registry.last_error
 
+    # The lookup FAILED. Never treat this as "new parent" or we register a
+    # duplicate child every time the platform blips or the JWT expires.
     if err:
         cached = check_existing_student_local(local)
         if cached:
@@ -354,7 +397,8 @@ async def t_find_children(s: dict, phone: str) -> dict:
                                 "Do NOT register anyone. Apologise briefly and "
                                 "ask them to try again in a few minutes.")}
 
-    
+    # The lookup SUCCEEDED and returned nothing. Any local row here is a
+    # leftover from a failed registration and has an unusable id, so ignore it.
     if not found:
         return {"children": [],
                 "note": "No children registered to this number yet."}
@@ -396,7 +440,8 @@ async def t_register_child(s: dict, name: str, level: str, gender: str) -> dict:
                                   name, level, gender, phone)
     err = registry.last_error
 
-   
+    # 409: they already exist on the platform. Adopt the real record rather
+    # than minting a local id that can never generate a worksheet.
     if not new and err == "exists":
         log.info("409 for %s, re-querying to adopt the existing record", name)
         existing = await asyncio.to_thread(registry.check_student_exists, phone)
@@ -427,7 +472,8 @@ async def t_register_child(s: dict, name: str, level: str, gender: str) -> dict:
                 "message": ("That child already exists but the records are "
                             "unreachable. Apologise and ask them to try shortly.")}
 
-    
+    # Any other failure. Keep the details locally so nothing is lost, but do
+    # NOT set the active child: a local id cannot generate a worksheet.
     if not new:
         log.error("Registration failed for %s (%s)", name, err)
         save_student_local(name, level, gender, phone,
@@ -489,7 +535,7 @@ async def t_create_practice(s: dict, topic_ids: list, difficulty: str,
     if difficulty not in DIFFICULTY_EMOJI:
         return {"error": "bad_difficulty", "valid": list(DIFFICULTY_EMOJI)}
 
-    # Validate topic ids against the real list. 
+    # Validate topic ids against the real list. Models occasionally invent one.
     if not s.get("topics"):
         s["topics"] = await asyncio.to_thread(
             _get_topics, s["child"].get("student_id")) or []
@@ -652,7 +698,7 @@ async def receive(request: Request, background: BackgroundTasks):
         log.info("STATUS %s -> %s (%s) %s", st.get("status"),
                  st.get("recipient_id"), st.get("id"), st.get("errors", ""))
 
-    
+    # Your version handled msgs[0] only; this drains the batch.
     for msg in value.get("messages", []):
         msg_id = msg.get("id")
         if msg_id in PROCESSED_IDS:
@@ -677,3 +723,5 @@ async def receive(request: Request, background: BackgroundTasks):
             background.add_task(agent_turn, msg["from"], text)
 
     return {"status": "ok"}
+
+    
