@@ -1,14 +1,3 @@
-"""
-WhatsPrep WhatsApp webhook — agent version.
-
-Replaces the step machine with an LLM agent loop. The model drives the
-conversation; your platform API calls are exposed to it as tools. All
-invariants (which child, which phone, question count/type) stay enforced
-in Python, never delegated to the model.
-
-Run: uvicorn main:app --host 0.0.0.0 --port $PORT
-"""
-
 import os
 import json
 import hmac
@@ -724,4 +713,3 @@ async def receive(request: Request, background: BackgroundTasks):
 
     return {"status": "ok"}
 
-    
