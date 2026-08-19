@@ -2,3 +2,6 @@
 credentials.json
 __pycache__/
 students.json
+.env
+students.json
+__pycache__/
