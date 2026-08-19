@@ -5,6 +5,8 @@ import hashlib
 import asyncio
 import logging
 import re
+import tempfile
+from contextlib import suppress
 from datetime import datetime
 
 import httpx
@@ -14,6 +16,7 @@ from openai import AsyncOpenAI
 from dotenv import load_dotenv
 
 from student_registry import StudentRegistry, normalize_level, LEVELS
+from pdf_utils import build_pdf
 
 load_dotenv()
 app = FastAPI()
@@ -33,8 +36,9 @@ MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 VERIFY_TOKEN = os.getenv("VERIFY_TOKEN")
 ACCESS_TOKEN = os.getenv("META_ACCESS_TOKEN")
 PHONE_NUMBER_ID = os.getenv("PHONE_NUMBER_ID")
-APP_SECRET = os.getenv("META_APP_SECRET")          # NEW — see verify_signature
+APP_SECRET = os.getenv("META_APP_SECRET")          # see verify_signature
 GRAPH_URL = f"https://graph.facebook.com/v21.0/{PHONE_NUMBER_ID}/messages"
+MEDIA_URL = f"https://graph.facebook.com/v21.0/{PHONE_NUMBER_ID}/media"
 
 registry = StudentRegistry(
     api_key=os.getenv("WHATSPREP_API_KEY"),
@@ -47,6 +51,11 @@ DB_FILE = "students.json"
 # and question_type. While False the bot still picks values internally but
 # does not promise them to the parent.
 SUPPORTS_QUESTION_OPTIONS = False
+
+# Set True once the platform confirms it can return question data (see
+# _generate_assessment_data). While False, the PDF tool exists but tells the
+# model to apologise and offer the normal link, so nothing breaks in chat.
+SUPPORTS_PDF = False
 
 LEVEL_DEFAULTS = {
     "Primary 1": {"count": 10, "type": "MCQ"},
@@ -89,6 +98,42 @@ async def send_message(to: str, text: str):
         )
         if r.status_code != 200:
             log.warning("Send failed: %s %s", r.status_code, r.text)
+
+
+async def send_document(to: str, filepath: str, filename: str,
+                        caption: str = "") -> bool:
+    """Send a PDF as a WhatsApp document: upload media, then send by id."""
+    async with httpx.AsyncClient(timeout=60) as http:
+        try:
+            with open(filepath, "rb") as f:
+                r = await http.post(
+                    MEDIA_URL,
+                    headers={"Authorization": f"Bearer {ACCESS_TOKEN}"},
+                    data={"messaging_product": "whatsapp",
+                          "type": "application/pdf"},
+                    files={"file": (filename, f, "application/pdf")},
+                )
+        except OSError as e:
+            log.error("Media file unreadable: %s", e)
+            return False
+        media_id = r.json().get("id") if r.status_code == 200 else None
+        if not media_id:
+            log.warning("Media upload failed: %s %s", r.status_code, r.text)
+            return False
+
+        r = await http.post(
+            GRAPH_URL,
+            headers={"Authorization": f"Bearer {ACCESS_TOKEN}",
+                     "Content-Type": "application/json"},
+            json={"messaging_product": "whatsapp", "to": to,
+                  "type": "document",
+                  "document": {"id": media_id, "filename": filename,
+                               "caption": caption[:1024]}},
+        )
+        if r.status_code != 200:
+            log.warning("Document send failed: %s %s", r.status_code, r.text)
+            return False
+        return True
 
 
 # ---------------------------------------------------------------- local db
@@ -141,8 +186,8 @@ def usable_student_id(student_id) -> bool:
 
 
 # ---------------------------------------------------------------- platform api
-# Unchanged from your version. Sync `requests` calls are wrapped in
-# asyncio.to_thread at the call site so they don't block the event loop.
+# Sync `requests` calls are wrapped in asyncio.to_thread at the call site so
+# they don't block the event loop.
 def _get_topics(student_id, subject: str = "Math") -> list | None:
     try:
         sid = int(student_id)
@@ -220,6 +265,58 @@ def _generate_worksheet_url(student_id, topic_ids, difficulty,
     return None
 
 
+def _generate_assessment_data(student_id, topic_ids, difficulty,
+                              count=None, qtype=None) -> list | None:
+    """Ask the platform for the actual questions + answers, for PDF papers.
+
+    ASSUMPTION TO CONFIRM with the platform team: /generate-assessment
+    accepts "include_questions": true and returns data.questions as a list
+    of objects with question/options/answer fields. Adjust the payload and
+    the field names below to whatever they actually implement, then flip
+    SUPPORTS_PDF to True.
+    """
+    try:
+        sid = int(student_id)
+        tids = [int(t) for t in topic_ids]
+    except (ValueError, TypeError):
+        return None
+    payload = {"topic_ids": tids, "student_id": sid,
+               "difficulty": difficulty, "include_questions": True}
+    if SUPPORTS_QUESTION_OPTIONS:
+        if count:
+            payload["question_count"] = count
+        if qtype:
+            payload["question_type"] = qtype
+    try:
+        r = requests.post(
+            "https://latam.whatsprep.com/api/generate-assessment",
+            headers=registry.headers,
+            json=payload,
+            timeout=45,
+        )
+        if r.status_code != 200:
+            log.warning("Assessment data failed: %s %s", r.status_code, r.text)
+            return None
+        d = r.json().get("data", {})
+        raw = d.get("questions") or []
+        questions = []
+        for q in raw:
+            questions.append({
+                "question": q.get("question") or q.get("question_text")
+                            or q.get("text") or "",
+                "options": q.get("options") or q.get("choices") or [],
+                "answer": q.get("answer") or q.get("correct_answer")
+                          or q.get("solution") or "",
+            })
+        questions = [q for q in questions if q["question"]]
+        log.info("Assessment data for student %s: %d questions",
+                 sid, len(questions))
+        return questions or None
+    except Exception as e:
+        log.error("Assessment data error: %s", e)
+    return None
+
+
 # ---------------------------------------------------------------- reply cleanup
 _MD_LINK = re.compile(r"\[([^\]]+)\]\(\s*(https?://[^\s)]+)\s*\)")
 _BARE_LINK = re.compile(r"https?://\S*whatsprep\.com\S*")
@@ -274,6 +371,18 @@ create_practice call as one topic_ids list. The platform combines them into \
 one paper. Never call create_practice more than once for the same request, \
 it produces several separate papers and several links.
 
+PDF OPTION
+If a parent asks for a printable paper, a PDF, or a hard copy, offer the \
+PDF version. Before generating, tell them plainly: the PDF comes with an \
+answer key on the last page, but it will NOT be marked by WhatsPrep and no \
+progress report will be sent - marking and reports only happen for practice \
+done through the link. If they confirm they want the PDF, call \
+create_practice_pdf with the same topic_ids and difficulty rules as \
+create_practice. The system sends the file itself; you just write one short \
+line after, like "Sent! The answer key is on the last page." Never call \
+both create_practice and create_practice_pdf for the same request unless \
+the parent explicitly asks for both.
+
 ASK AS FEW QUESTIONS AS POSSIBLE
 Read everything the parent gave you in one message and act on it. \
 "my girl is in p4, fractions are killing her" is enough to register or find \
@@ -296,7 +405,7 @@ FLOW
 
 STYLE
 Write like a helpful person texting. Short sentences, plain English, warm, \
-no markdown, no bullet characters, no headings. Many parents are not \
+no markdown, no bullet characters, no headings. You may use emoticons to convey tone. Many parents are not \
 tech-savvy. One or two short messages, never a wall of text. When you list \
 topics, number them so a parent can reply with a number.
 
@@ -388,6 +497,23 @@ TOOLS = [
                           "description": ("ALL requested topic_ids from list_topics, in "
                                           "one list. e.g. topics 2, 5 and 6 becomes "
                                           "[\"2\",\"5\",\"6\"], not three calls.")},
+            "subtopic_id": {"type": "string",
+                            "description": "Optional, only if one was chosen"},
+            "difficulty": {"type": "string", "enum": ["Easy", "Medium", "Hard"]}},
+            "required": ["topic_ids", "difficulty"]},
+    }},
+    {"type": "function", "function": {
+        "name": "create_practice_pdf",
+        "description": ("Generate a printable PDF paper with an answer key on the "
+                        "last page, delivered as a WhatsApp document. PDF papers "
+                        "are NOT marked and produce NO report. Only call after the "
+                        "parent has confirmed they want the PDF and you have told "
+                        "them it will not be marked. The system sends the file "
+                        "itself; do not describe a link."),
+        "parameters": {"type": "object", "properties": {
+            "topic_ids": {"type": "array", "items": {"type": "string"},
+                          "description": ("ALL requested topic_ids from list_topics, "
+                                          "in one list, same rule as create_practice.")},
             "subtopic_id": {"type": "string",
                             "description": "Optional, only if one was chosen"},
             "difficulty": {"type": "string", "enum": ["Easy", "Medium", "Hard"]}},
@@ -553,8 +679,12 @@ async def t_list_subtopics(s: dict, topic_id: str) -> dict:
                           for x in subs]}
 
 
-async def t_create_practice(s: dict, topic_ids: list, difficulty: str,
-                            subtopic_id: str | None = None) -> dict:
+def _validate_practice_request(s: dict, topic_ids: list, difficulty: str):
+    """Shared guards for create_practice and create_practice_pdf.
+
+    Returns an error dict, or None if the request is valid. Fills the
+    session topic cache as a side effect (needed for validation anyway).
+    """
     if not s.get("child"):
         return {"error": "no_child", "message": "Select or register a child first."}
     if not usable_student_id(s["child"].get("student_id")):
@@ -563,8 +693,11 @@ async def t_create_practice(s: dict, topic_ids: list, difficulty: str,
                             "generated. Apologise and ask them to try shortly.")}
     if difficulty not in DIFFICULTY_EMOJI:
         return {"error": "bad_difficulty", "valid": list(DIFFICULTY_EMOJI)}
+    return None
 
-    # Validate topic ids against the real list. Models occasionally invent one.
+
+async def _validate_topics(s: dict, topic_ids: list):
+    """Topic-id check against the real list. Models occasionally invent one."""
     if not s.get("topics"):
         s["topics"] = await asyncio.to_thread(
             _get_topics, s["child"].get("student_id")) or []
@@ -575,6 +708,17 @@ async def t_create_practice(s: dict, topic_ids: list, difficulty: str,
                 "valid_topics": [{"topic_id": str(t.get("topic_id")),
                                   "topic_name": t.get("topic_name")}
                                  for t in s["topics"]]}
+    return None
+
+
+async def t_create_practice(s: dict, topic_ids: list, difficulty: str,
+                            subtopic_id: str | None = None) -> dict:
+    err = _validate_practice_request(s, topic_ids, difficulty)
+    if err:
+        return err
+    err = await _validate_topics(s, topic_ids)
+    if err:
+        return err
 
     child = s["child"]
     level = normalize_level(child.get("primary_level", ""))
@@ -596,6 +740,76 @@ async def t_create_practice(s: dict, topic_ids: list, difficulty: str,
             "child": child.get("name")}
 
 
+async def t_create_practice_pdf(s: dict, topic_ids: list, difficulty: str,
+                                subtopic_id: str | None = None) -> dict:
+    err = _validate_practice_request(s, topic_ids, difficulty)
+    if err:
+        return err
+
+    if not SUPPORTS_PDF:
+        return {"error": "pdf_unavailable",
+                "message": ("PDF papers are not available yet. Apologise in one "
+                            "short line and offer the normal practice link "
+                            "instead. Do not promise PDFs for later.")}
+
+    err = await _validate_topics(s, topic_ids)
+    if err:
+        return err
+
+    child = s["child"]
+    phone = s.get("phone_full", "")
+    if not phone:
+        return {"error": "internal_error",
+                "message": "Could not deliver. Ask them to try again."}
+
+    level = normalize_level(child.get("primary_level", "")) or "Primary"
+    picked = defaults_for(level, difficulty)
+    ids = [subtopic_id] if subtopic_id else list(map(str, topic_ids))
+    wanted = set(map(str, topic_ids))
+    topic_names = [t.get("topic_name") for t in s["topics"]
+                   if str(t.get("topic_id")) in wanted]
+
+    # Generation takes a few seconds; say so instead of going silent.
+    await send_message(phone, "Putting the paper together now, one moment 📄")
+
+    questions = await asyncio.to_thread(
+        _generate_assessment_data, child.get("student_id"), ids, difficulty,
+        picked["count"], picked["type"])
+    if not questions:
+        return {"error": "generation_failed",
+                "message": "Could not generate the PDF just now. Offer the "
+                           "normal practice link instead."}
+
+    name = (child.get("name") or "Practice").strip()
+    safe_name = re.sub(r"[^A-Za-z0-9 _-]", "", name) or "Practice"
+    filename = f"{safe_name} - {level} {difficulty} Practice.pdf"
+
+    tmp = tempfile.NamedTemporaryFile(suffix=".pdf", delete=False)
+    tmp.close()
+    try:
+        await asyncio.to_thread(
+            build_pdf, tmp.name, name, level, topic_names, difficulty, questions)
+        caption = (f"{name}'s practice paper — answer key on the last page. "
+                   "PDF papers aren't marked and don't count towards reports.")
+        delivered = await send_document(phone, tmp.name, filename, caption)
+    except Exception as e:
+        log.exception("PDF build/send failed")
+        delivered = False
+    finally:
+        with suppress(OSError):
+            os.unlink(tmp.name)
+
+    if not delivered:
+        return {"error": "delivery_failed",
+                "message": ("The PDF could not be sent. Apologise and offer "
+                            "the normal practice link instead.")}
+    return {"ok": True, "delivered": "pdf", "child": name,
+            "questions": len(questions),
+            "message": ("PDF sent as a document. Confirm in one short line and "
+                        "remind them the answer key is on the last page and "
+                        "that PDF papers are not marked.")}
+
+
 async def t_end_conversation(s: dict) -> dict:
     s["_end"] = True
     return {"ok": True}
@@ -608,6 +822,7 @@ DISPATCH = {
     "list_topics": t_list_topics,
     "list_subtopics": t_list_subtopics,
     "create_practice": t_create_practice,
+    "create_practice_pdf": t_create_practice_pdf,
     "end_conversation": t_end_conversation,
 }
 
@@ -630,6 +845,7 @@ async def run_tool(name: str, args: dict, s: dict, phone: str) -> dict:
 # ---------------------------------------------------------------- agent loop
 async def agent_turn(phone: str, text: str) -> None:
     s = session_for(phone)
+    s["phone_full"] = phone          # used by tools that deliver directly (PDF)
     history = s["messages"]
     history.append({"role": "user", "content": text})
     log.info("IN  %s %r", phone[-4:], text[:80])
@@ -696,7 +912,7 @@ async def agent_turn(phone: str, text: str) -> None:
 
 # ---------------------------------------------------------------- webhook
 def verify_signature(body: bytes, header: str | None) -> bool:
-    """Your previous version accepted any POST to /. This closes that."""
+    """Reject unsigned webhook POSTs."""
     if not APP_SECRET:
         log.warning("META_APP_SECRET not set — signature check skipped")
         return True
@@ -736,7 +952,6 @@ async def receive(request: Request, background: BackgroundTasks):
         log.info("STATUS %s -> %s (%s) %s", st.get("status"),
                  st.get("recipient_id"), st.get("id"), st.get("errors", ""))
 
-    # Your version handled msgs[0] only; this drains the batch.
     for msg in value.get("messages", []):
         msg_id = msg.get("id")
         if msg_id in PROCESSED_IDS:
@@ -762,3 +977,4 @@ async def receive(request: Request, background: BackgroundTasks):
 
     return {"status": "ok"}
 
+    
