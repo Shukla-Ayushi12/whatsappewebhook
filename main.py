@@ -56,6 +56,15 @@ SUPPORTS_QUESTION_OPTIONS = False
 # the PDF option off in chat without redeploying anything else.
 SUPPORTS_PDF = True
 
+# Report template (Meta > WhatsApp Manager > Message templates). The template
+# uses NAMED parameters ({{student_name}}, {{report_link}}), so sends must
+# name each parameter. Check the language code matches the approved template.
+REPORT_TEMPLATE_NAME = os.getenv("REPORT_TEMPLATE_NAME", "report_ready")
+REPORT_TEMPLATE_LANG = os.getenv("REPORT_TEMPLATE_LANG", "en")
+# Shared secret for the platform's report callback. Give the same value to
+# the platform team; requests without it are rejected.
+PLATFORM_CALLBACK_SECRET = os.getenv("PLATFORM_CALLBACK_SECRET")
+
 LEVEL_DEFAULTS = {
     "Primary 1": {"count": 10, "type": "MCQ"},
     "Primary 2": {"count": 10, "type": "MCQ"},
@@ -132,6 +141,45 @@ async def send_document(to: str, filepath: str, filename: str,
         if r.status_code != 200:
             log.warning("Document send failed: %s %s", r.status_code, r.text)
             return False
+        return True
+
+
+async def send_report_template(to: str, student_name: str,
+                               report_link: str) -> bool:
+    """Send the approved "report_ready" template.
+
+    Template messages are required here: the child may finish practice hours
+    after the parent's last message, outside WhatsApp's 24-hour service
+    window where free-form messages are rejected.
+    """
+    payload = {
+        "messaging_product": "whatsapp", "to": to, "type": "template",
+        "template": {
+            "name": REPORT_TEMPLATE_NAME,
+            "language": {"code": REPORT_TEMPLATE_LANG},
+            "components": [{
+                "type": "body",
+                "parameters": [
+                    {"type": "text", "parameter_name": "student_name",
+                     "text": str(student_name)[:512]},
+                    {"type": "text", "parameter_name": "report_link",
+                     "text": str(report_link)[:1024]},
+                ],
+            }],
+        },
+    }
+    async with httpx.AsyncClient(timeout=15) as http:
+        r = await http.post(
+            GRAPH_URL,
+            headers={"Authorization": f"Bearer {ACCESS_TOKEN}",
+                     "Content-Type": "application/json"},
+            json=payload,
+        )
+        if r.status_code != 200:
+            log.warning("Report template send failed: %s %s",
+                        r.status_code, r.text)
+            return False
+        log.info("Report template sent to %s", to[-4:])
         return True
 
 
@@ -942,3 +990,45 @@ async def receive(request: Request, background: BackgroundTasks):
             background.add_task(agent_turn, msg["from"], text)
 
     return {"status": "ok"}
+
+
+@app.post("/assessment-completed")
+async def assessment_completed(request: Request, background: BackgroundTasks):
+    """Called by the WhatsPrep platform when a child finishes an assessment.
+
+    Expected JSON body (agree the exact shape with the platform team):
+      {
+        "student_id": 5,
+        "student_name": "Chloe",
+        "phone": "6591234567",      # parent's WhatsApp number
+        "report_link": "https://app.whatsprep.com/report/..."
+      }
+    Requires header X-Callback-Secret matching PLATFORM_CALLBACK_SECRET.
+    """
+    if not PLATFORM_CALLBACK_SECRET or \
+            request.headers.get("X-Callback-Secret") != PLATFORM_CALLBACK_SECRET:
+        log.warning("Rejected report callback (bad or missing secret)")
+        return Response(status_code=403)
+
+    try:
+        data = await request.json()
+    except Exception:
+        return Response(status_code=400)
+
+    phone = re.sub(r"\D", "", str(data.get("phone", "")))
+    if phone and not phone.startswith("65"):
+        phone = "65" + phone
+    student_name = (data.get("student_name") or "").strip() or "Your child"
+    report_link = (data.get("report_link") or "").strip()
+
+    if not phone or not report_link:
+        log.warning("Report callback missing phone or report_link: %s",
+                    {k: data.get(k) for k in ("student_id", "phone",
+                                              "report_link")})
+        return {"status": "ignored", "reason": "missing phone or report_link"}
+
+    background.add_task(send_report_template, phone, student_name, report_link)
+    log.info("Report queued for %s (student %s)", phone[-4:],
+             data.get("student_id"))
+    return {"status": "ok"}
+    
