@@ -16,7 +16,6 @@ from openai import AsyncOpenAI
 from dotenv import load_dotenv
 
 from student_registry import StudentRegistry, normalize_level, LEVELS
-from pdf_utils import build_pdf
 
 load_dotenv()
 app = FastAPI()
@@ -52,10 +51,10 @@ DB_FILE = "students.json"
 # does not promise them to the parent.
 SUPPORTS_QUESTION_OPTIONS = False
 
-# Set True once the platform confirms it can return question data (see
-# _generate_assessment_data). While False, the PDF tool exists but tells the
-# model to apologise and offer the normal link, so nothing breaks in chat.
-SUPPORTS_PDF = False
+# The platform's /generate-assessment now accepts is_offline (1 = PDF link,
+# 0 = online assessment link) per Dinesh, Aug 2026. Flip to False to switch
+# the PDF option off in chat without redeploying anything else.
+SUPPORTS_PDF = True
 
 LEVEL_DEFAULTS = {
     "Primary 1": {"count": 10, "type": "MCQ"},
@@ -234,13 +233,16 @@ def _get_subtopics(student_id, topic_id) -> list | None:
 
 
 def _generate_worksheet_url(student_id, topic_ids, difficulty,
-                            count=None, qtype=None) -> str | None:
+                            count=None, qtype=None, is_offline: int = 0) -> str | None:
+    """is_offline=0 -> online assessment link. is_offline=1 -> PDF link.
+    (Platform update Aug 2026: same endpoint, new request-body field.)"""
     try:
         sid = int(student_id)
         tids = [int(t) for t in topic_ids]
     except (ValueError, TypeError):
         return None
-    payload = {"topic_ids": tids, "student_id": sid, "difficulty": difficulty}
+    payload = {"topic_ids": tids, "student_id": sid, "difficulty": difficulty,
+               "is_offline": is_offline}
     if SUPPORTS_QUESTION_OPTIONS:
         if count:
             payload["question_count"] = count
@@ -255,65 +257,15 @@ def _generate_worksheet_url(student_id, topic_ids, difficulty,
         )
         if r.status_code == 200:
             d = r.json().get("data", {})
-            url = d.get("assessment_url") or d.get("assessment_ur") or d.get("url")
+            url = (d.get("assessment_url") or d.get("assessment_ur")
+                   or d.get("pdf_url") or d.get("pdf_link")
+                   or d.get("file_url") or d.get("url"))
             log.info("Generated worksheet for student %s topics %s: %s",
                      sid, tids, bool(url))
             return url
         log.warning("Generate failed: %s %s", r.status_code, r.text)
     except Exception as e:
         log.error("Generate error: %s", e)
-    return None
-
-
-def _generate_assessment_data(student_id, topic_ids, difficulty,
-                              count=None, qtype=None) -> list | None:
-    """Ask the platform for the actual questions + answers, for PDF papers.
-
-    ASSUMPTION TO CONFIRM with the platform team: /generate-assessment
-    accepts "include_questions": true and returns data.questions as a list
-    of objects with question/options/answer fields. Adjust the payload and
-    the field names below to whatever they actually implement, then flip
-    SUPPORTS_PDF to True.
-    """
-    try:
-        sid = int(student_id)
-        tids = [int(t) for t in topic_ids]
-    except (ValueError, TypeError):
-        return None
-    payload = {"topic_ids": tids, "student_id": sid,
-               "difficulty": difficulty, "include_questions": True}
-    if SUPPORTS_QUESTION_OPTIONS:
-        if count:
-            payload["question_count"] = count
-        if qtype:
-            payload["question_type"] = qtype
-    try:
-        r = requests.post(
-            "https://latam.whatsprep.com/api/generate-assessment",
-            headers=registry.headers,
-            json=payload,
-            timeout=45,
-        )
-        if r.status_code != 200:
-            log.warning("Assessment data failed: %s %s", r.status_code, r.text)
-            return None
-        d = r.json().get("data", {})
-        raw = d.get("questions") or []
-        questions = []
-        for q in raw:
-            questions.append({
-                "question": q.get("question") or q.get("question_text")
-                            or q.get("text") or "",
-                "options": q.get("options") or q.get("choices") or [],
-                "answer": q.get("answer") or q.get("correct_answer")
-                          or q.get("solution") or "",
-            })
-        questions = [q for q in questions if q["question"]]
-        log.info("Assessment data for student %s: %d questions",
-                 sid, len(questions))
-        return questions or None
-    except Exception as e:
-        log.error("Assessment data error: %s", e)
     return None
 
 
@@ -374,12 +326,12 @@ it produces several separate papers and several links.
 PDF OPTION
 If a parent asks for a printable paper, a PDF, or a hard copy, offer the \
 PDF version. Before generating, tell them plainly: the PDF comes with an \
-answer key on the last page, but it will NOT be marked by WhatsPrep and no \
+answer key, but it will NOT be marked by WhatsPrep and no \
 progress report will be sent - marking and reports only happen for practice \
 done through the link. If they confirm they want the PDF, call \
 create_practice_pdf with the same topic_ids and difficulty rules as \
 create_practice. The system sends the file itself; you just write one short \
-line after, like "Sent! The answer key is on the last page." Never call \
+line after, like "Sent! Answer key is included for you." Never call \
 both create_practice and create_practice_pdf for the same request unless \
 the parent explicitly asks for both.
 
@@ -504,8 +456,8 @@ TOOLS = [
     }},
     {"type": "function", "function": {
         "name": "create_practice_pdf",
-        "description": ("Generate a printable PDF paper with an answer key on the "
-                        "last page, delivered as a WhatsApp document. PDF papers "
+        "description": ("Generate a printable PDF paper with an answer key, "
+                        "delivered as a WhatsApp document. PDF papers "
                         "are NOT marked and produce NO report. Only call after the "
                         "parent has confirmed they want the PDF and you have told "
                         "them it will not be marked. The system sends the file "
@@ -748,9 +700,9 @@ async def t_create_practice_pdf(s: dict, topic_ids: list, difficulty: str,
 
     if not SUPPORTS_PDF:
         return {"error": "pdf_unavailable",
-                "message": ("PDF papers are not available yet. Apologise in one "
-                            "short line and offer the normal practice link "
-                            "instead. Do not promise PDFs for later.")}
+                "message": ("PDF papers are switched off right now. Apologise in "
+                            "one short line and offer the normal practice link "
+                            "instead.")}
 
     err = await _validate_topics(s, topic_ids)
     if err:
@@ -765,49 +717,62 @@ async def t_create_practice_pdf(s: dict, topic_ids: list, difficulty: str,
     level = normalize_level(child.get("primary_level", "")) or "Primary"
     picked = defaults_for(level, difficulty)
     ids = [subtopic_id] if subtopic_id else list(map(str, topic_ids))
-    wanted = set(map(str, topic_ids))
-    topic_names = [t.get("topic_name") for t in s["topics"]
-                   if str(t.get("topic_id")) in wanted]
 
     # Generation takes a few seconds; say so instead of going silent.
     await send_message(phone, "Putting the paper together now, one moment 📄")
 
-    questions = await asyncio.to_thread(
-        _generate_assessment_data, child.get("student_id"), ids, difficulty,
-        picked["count"], picked["type"])
-    if not questions:
+    url = await asyncio.to_thread(
+        _generate_worksheet_url, child.get("student_id"), ids, difficulty,
+        picked["count"], picked["type"], 1)          # is_offline=1 -> PDF
+    if not url:
         return {"error": "generation_failed",
-                "message": "Could not generate the PDF just now. Offer the "
-                           "normal practice link instead."}
+                "message": ("Could not generate the PDF just now. Offer the "
+                            "normal practice link instead.")}
 
     name = (child.get("name") or "Practice").strip()
     safe_name = re.sub(r"[^A-Za-z0-9 _-]", "", name) or "Practice"
     filename = f"{safe_name} - {level} {difficulty} Practice.pdf"
+    caption = (f"{name}'s practice paper. PDF papers aren't marked and "
+               "don't count towards reports.")
 
+    # Best delivery: fetch the file and send it as a real WhatsApp document,
+    # so the paper sits in the chat ready to print. If anything about the
+    # download looks off, fall back to handing over the link.
     tmp = tempfile.NamedTemporaryFile(suffix=".pdf", delete=False)
     tmp.close()
+    delivered = False
     try:
-        await asyncio.to_thread(
-            build_pdf, tmp.name, name, level, topic_names, difficulty, questions)
-        caption = (f"{name}'s practice paper — answer key on the last page. "
-                   "PDF papers aren't marked and don't count towards reports.")
-        delivered = await send_document(phone, tmp.name, filename, caption)
-    except Exception as e:
-        log.exception("PDF build/send failed")
-        delivered = False
+        async with httpx.AsyncClient(timeout=60, follow_redirects=True) as http:
+            r = await http.get(url)
+        if r.status_code == 200 and (r.content[:5] == b"%PDF-" or
+                                     "pdf" in r.headers.get("content-type", "").lower()):
+            with open(tmp.name, "wb") as f:
+                f.write(r.content)
+            delivered = await send_document(phone, tmp.name, filename, caption)
+        else:
+            log.info("PDF url did not serve a raw pdf (status %s, type %s); "
+                     "falling back to link", r.status_code,
+                     r.headers.get("content-type"))
+    except Exception:
+        log.exception("PDF fetch/send failed; falling back to link")
     finally:
         with suppress(OSError):
             os.unlink(tmp.name)
 
-    if not delivered:
-        return {"error": "delivery_failed",
-                "message": ("The PDF could not be sent. Apologise and offer "
-                            "the normal practice link instead.")}
-    return {"ok": True, "delivered": "pdf", "child": name,
-            "questions": len(questions),
-            "message": ("PDF sent as a document. Confirm in one short line and "
-                        "remind them the answer key is on the last page and "
-                        "that PDF papers are not marked.")}
+    if delivered:
+        return {"ok": True, "delivered": "pdf_document", "child": name,
+                "message": ("PDF sent as a document in the chat. Confirm in one "
+                            "short line and remind them PDF papers are not "
+                            "marked and no report will come.")}
+
+    # Fallback: the download link is appended to your message automatically,
+    # same as a normal practice link. Do not write the URL yourself.
+    return {"link": url, "delivered": "pdf_link", "child": name,
+            "difficulty": difficulty,
+            "message": ("Could not attach the file directly, so the PDF "
+                        "download link will be added to your message. Say the "
+                        "paper is ready to download, and remind them it is "
+                        "not marked.")}
 
 
 async def t_end_conversation(s: dict) -> dict:
@@ -891,7 +856,8 @@ async def agent_turn(phone: str, text: str) -> None:
                             "content": json.dumps(result)})
 
             link = result.get("link")
-            if call.function.name == "create_practice" and link:
+            if call.function.name in ("create_practice", "create_practice_pdf") \
+                    and link:
                 if link not in pending_links:
                     pending_links.append(link)
     else:
@@ -976,5 +942,3 @@ async def receive(request: Request, background: BackgroundTasks):
             background.add_task(agent_turn, msg["from"], text)
 
     return {"status": "ok"}
-
-    
