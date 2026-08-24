@@ -289,7 +289,9 @@ def _generate_worksheet_url(student_id, topic_ids, difficulty,
         tids = [int(t) for t in topic_ids]
     except (ValueError, TypeError):
         return None
-    payload = {"topic_ids": tids, "student_id": sid, "difficulty": difficulty,
+    # Platform update (Aug 2026) documents lowercase difficulty ("easy").
+    payload = {"topic_ids": tids, "student_id": sid,
+               "difficulty": str(difficulty).lower(),
                "is_offline": is_offline}
     if SUPPORTS_QUESTION_OPTIONS:
         if count:
@@ -1031,4 +1033,5 @@ async def assessment_completed(request: Request, background: BackgroundTasks):
     log.info("Report queued for %s (student %s)", phone[-4:],
              data.get("student_id"))
     return {"status": "ok"}
+
     
