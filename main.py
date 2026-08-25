@@ -183,6 +183,61 @@ async def send_report_template(to: str, student_name: str,
         return True
 
 
+# ------------------------------------------------------- report watcher
+# The platform has no completion callback; it only offers a pull API. After
+# each generated practice we poll /student-reports in the background and send
+# the report_ready template when a NEW report shows up. One watcher per
+# student at a time; a new practice replaces the old watcher.
+# NOTE: watchers live in this process. A restart or (on free hosting) a
+# spin-down kills them - another reason to run an always-on instance.
+REPORT_WATCHES: dict[int, asyncio.Task] = {}
+REPORT_WATCH_INTERVAL = 300        # seconds between polls
+REPORT_WATCH_LIFETIME = 6 * 3600   # give up after 6 hours
+
+
+async def _watch_for_report(student_id: int, phone: str, student_name: str):
+    try:
+        baseline = await asyncio.to_thread(_get_student_reports, student_id)
+        known = {r.get("quiz_id_explico") for r in (baseline or [])}
+        waited = 0
+        while waited < REPORT_WATCH_LIFETIME:
+            await asyncio.sleep(REPORT_WATCH_INTERVAL)
+            waited += REPORT_WATCH_INTERVAL
+            reports = await asyncio.to_thread(_get_student_reports, student_id)
+            if not reports:
+                continue
+            new = [r for r in reports
+                   if r.get("quiz_id_explico") not in known]
+            if new:
+                latest = new[0]          # list is sorted newest first
+                ok = await send_report_template(
+                    phone, student_name, latest.get("report_link", ""))
+                log.info("Report watcher fired for student %s (quiz %s): %s",
+                         student_id, latest.get("quiz_id_explico"),
+                         "sent" if ok else "SEND FAILED")
+                return
+        log.info("Report watcher expired for student %s", student_id)
+    except asyncio.CancelledError:
+        pass
+    except Exception:
+        log.exception("Report watcher crashed for student %s", student_id)
+    finally:
+        REPORT_WATCHES.pop(student_id, None)
+
+
+def start_report_watch(student_id, phone: str, student_name: str):
+    try:
+        sid = int(student_id)
+    except (ValueError, TypeError):
+        return
+    old = REPORT_WATCHES.get(sid)
+    if old and not old.done():
+        old.cancel()
+    REPORT_WATCHES[sid] = asyncio.get_event_loop().create_task(
+        _watch_for_report(sid, phone, student_name))
+    log.info("Report watcher started for student %s", sid)
+
+
 # ---------------------------------------------------------------- local db
 def load_database() -> list:
     try:
@@ -319,6 +374,37 @@ def _generate_worksheet_url(student_id, topic_ids, difficulty,
     return None
 
 
+def _get_student_reports(student_id) -> list | None:
+    """Completed-assessment reports for a student, newest first.
+
+    POST /student-reports {"student_id": N} ->
+      data: [{quiz_id_explico, homework_quiz_title, report_link}, ...]
+    """
+    try:
+        sid = int(student_id)
+    except (ValueError, TypeError):
+        return None
+    try:
+        r = requests.post(
+            "https://latam.whatsprep.com/api/student-reports",
+            headers=registry.headers,
+            json={"student_id": sid},
+            timeout=15,
+        )
+        if r.status_code == 200:
+            data = r.json().get("data") or []
+            # Defensive ordering: quiz ids increase over time, so sort
+            # descending instead of trusting response order.
+            data = [d for d in data if d.get("report_link")]
+            data.sort(key=lambda d: d.get("quiz_id_explico") or 0, reverse=True)
+            log.info("Reports for student %s: %d", sid, len(data))
+            return data
+        log.warning("Reports failed: %s %s", r.status_code, r.text)
+    except Exception as e:
+        log.error("Reports error: %s", e)
+    return None
+
+
 # ---------------------------------------------------------------- reply cleanup
 _MD_LINK = re.compile(r"\[([^\]]+)\]\(\s*(https?://[^\s)]+)\s*\)")
 _BARE_LINK = re.compile(r"https?://\S*whatsprep\.com\S*")
@@ -384,6 +470,13 @@ create_practice. The system sends the file itself; you just write one short \
 line after, like "Sent! Answer key is included for you." Never call \
 both create_practice and create_practice_pdf for the same request unless \
 the parent explicitly asks for both.
+
+REPORTS
+When a parent asks how their child did, for scores, results, or the report, \
+call get_report and share the latest report link in one short line. The \
+system also notifies parents automatically when a fresh report is ready, so \
+never promise to "send it later" yourself. If there are no reports yet, \
+explain the report appears after their child finishes a practice set.
 
 ASK AS FEW QUESTIONS AS POSSIBLE
 Read everything the parent gave you in one message and act on it. \
@@ -520,6 +613,14 @@ TOOLS = [
                             "description": "Optional, only if one was chosen"},
             "difficulty": {"type": "string", "enum": ["Easy", "Medium", "Hard"]}},
             "required": ["topic_ids", "difficulty"]},
+    }},
+    {"type": "function", "function": {
+        "name": "get_report",
+        "description": ("Fetch the child's completed practice reports. Call when "
+                        "the parent asks how their child did, for results, scores, "
+                        "or the report. Returns the latest report link, which the "
+                        "system appends to your message automatically."),
+        "parameters": {"type": "object", "properties": {}},
     }},
     {"type": "function", "function": {
         "name": "end_conversation",
@@ -737,6 +838,14 @@ async def t_create_practice(s: dict, topic_ids: list, difficulty: str,
     if not url:
         return {"error": "generation_failed",
                 "message": "Could not generate just now, ask them to try again."}
+
+    # Watch for the completed report and push the report_ready template
+    # when it appears. Online practice only; PDFs are not marked.
+    phone = s.get("phone_full", "")
+    if phone:
+        start_report_watch(child.get("student_id"), phone,
+                           child.get("name") or "Your child")
+
     return {"link": url, "difficulty": difficulty,
             "emoji": DIFFICULTY_EMOJI.get(difficulty, ""),
             "child": child.get("name")}
@@ -825,6 +934,35 @@ async def t_create_practice_pdf(s: dict, topic_ids: list, difficulty: str,
                         "not marked.")}
 
 
+async def t_get_report(s: dict) -> dict:
+    if not s.get("child"):
+        return {"error": "no_child", "message": "Select or register a child first."}
+    if not usable_student_id(s["child"].get("student_id")):
+        return {"error": "child_not_on_platform",
+                "message": ("Not on the platform yet. Apologise and ask them "
+                            "to try again shortly.")}
+    reports = await asyncio.to_thread(
+        _get_student_reports, s["child"].get("student_id"))
+    if reports is None:
+        return {"error": "unavailable",
+                "message": "Reports could not be loaded right now. Apologise "
+                           "and ask them to try again in a few minutes."}
+    if not reports:
+        return {"reports": 0,
+                "note": ("No completed practice yet. Tell them the report "
+                         "appears here once their child finishes a practice "
+                         "set through the link.")}
+    latest = reports[0]
+    return {"link": latest.get("report_link"),
+            "title": latest.get("homework_quiz_title"),
+            "total_reports": len(reports),
+            "child": s["child"].get("name"),
+            "message": ("Latest report found. Write one short line like "
+                        "\'Here\'s how NAME did on their latest practice\' - "
+                        "the link is appended automatically, never write it "
+                        "yourself.")}
+
+
 async def t_end_conversation(s: dict) -> dict:
     s["_end"] = True
     return {"ok": True}
@@ -838,6 +976,7 @@ DISPATCH = {
     "list_subtopics": t_list_subtopics,
     "create_practice": t_create_practice,
     "create_practice_pdf": t_create_practice_pdf,
+    "get_report": t_get_report,
     "end_conversation": t_end_conversation,
 }
 
@@ -906,8 +1045,8 @@ async def agent_turn(phone: str, text: str) -> None:
                             "content": json.dumps(result)})
 
             link = result.get("link")
-            if call.function.name in ("create_practice", "create_practice_pdf") \
-                    and link:
+            if call.function.name in ("create_practice", "create_practice_pdf",
+                                      "get_report") and link:
                 if link not in pending_links:
                     pending_links.append(link)
     else:
