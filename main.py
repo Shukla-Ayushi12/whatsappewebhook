@@ -6,6 +6,7 @@ import asyncio
 import logging
 import re
 import tempfile
+from collections import deque
 from contextlib import suppress
 from datetime import datetime
 
@@ -78,10 +79,29 @@ DIFFICULTY_EMOJI = {"Easy": "\U0001F7E2", "Medium": "\U0001F7E1", "Hard": "\U000
 
 MAX_HISTORY = 24        # messages kept per parent
 MAX_TOOL_HOPS = 6       # safety valve on the agent loop
+MAX_PROCESSED = 1000    # inbound message ids remembered for dedupe
 
 # phone -> {"messages": [...], "child": {...} | None, "topics": [...] }
 SESSIONS: dict[str, dict] = {}
+
+# Inbound ids already handled, so Meta's delivery retries don't double-reply.
+# The deque gives oldest-first eviction; clearing the whole set at a limit
+# would let a retry for a recent message slip through right after the wipe.
 PROCESSED_IDS: set[str] = set()
+PROCESSED_ORDER: deque[str] = deque(maxlen=MAX_PROCESSED)
+
+
+def already_processed(msg_id: str) -> bool:
+    """True if this inbound id was already handled. Records it if not."""
+    if not msg_id:
+        return False
+    if msg_id in PROCESSED_IDS:
+        return True
+    if len(PROCESSED_ORDER) == PROCESSED_ORDER.maxlen:
+        PROCESSED_IDS.discard(PROCESSED_ORDER[0])   # evicted by the append below
+    PROCESSED_ORDER.append(msg_id)
+    PROCESSED_IDS.add(msg_id)
+    return False
 
 
 def defaults_for(level: str, difficulty: str) -> dict:
@@ -233,7 +253,10 @@ def start_report_watch(student_id, phone: str, student_name: str):
     old = REPORT_WATCHES.get(sid)
     if old and not old.done():
         old.cancel()
-    REPORT_WATCHES[sid] = asyncio.get_event_loop().create_task(
+    # Called from inside the running loop, so create_task is the correct call.
+    # asyncio.get_event_loop() is deprecated and its behaviour inside a running
+    # loop has shifted between Python versions.
+    REPORT_WATCHES[sid] = asyncio.create_task(
         _watch_for_report(sid, phone, student_name))
     log.info("Report watcher started for student %s", sid)
 
@@ -433,6 +456,52 @@ def session_for(phone: str) -> dict:
     if phone not in SESSIONS:
         SESSIONS[phone] = {"messages": [], "child": None, "topics": []}
     return SESSIONS[phone]
+
+
+# ------------------------------------------------------- history integrity
+# OpenAI rejects any `tool` message that is not immediately preceded by the
+# assistant message whose `tool_calls` it answers:
+#   400 - messages with role 'tool' must be a response to a preceeding
+#         message with 'tool_calls'
+# A plain `history[-MAX_HISTORY:]` can cut between an assistant tool-call
+# message and its replies, orphaning them. Once an orphan sits at the front
+# of a session's history, EVERY later request in that session fails until the
+# process restarts. So: slice first, then repair, and repair again on load so
+# an already-poisoned in-memory session heals itself.
+
+def sanitize_history(messages: list) -> list:
+    """Drop orphaned tool messages and tool_calls whose replies are missing."""
+    out, i, n = [], 0, len(messages)
+    while i < n:
+        m = messages[i]
+        role = m.get("role")
+
+        if role == "tool":                      # no parent tool_calls: drop it
+            i += 1
+            continue
+
+        if role == "assistant" and m.get("tool_calls"):
+            ids = {tc.get("id") for tc in m["tool_calls"]}
+            j, replies = i + 1, []
+            while j < n and messages[j].get("role") == "tool":
+                if messages[j].get("tool_call_id") in ids:
+                    replies.append(messages[j])
+                j += 1
+            if {r.get("tool_call_id") for r in replies} == ids:
+                out.append(m)                   # complete pair: keep together
+                out.extend(replies)
+            # incomplete: drop the call and its partial replies entirely
+            i = j
+            continue
+
+        out.append(m)
+        i += 1
+    return out
+
+
+def trim_history(messages: list, keep: int = MAX_HISTORY) -> list:
+    """Slice to the window, then repair whatever the slice broke."""
+    return sanitize_history(messages[-keep:])
 
 
 # ---------------------------------------------------------------- prompt
@@ -1000,7 +1069,10 @@ async def run_tool(name: str, args: dict, s: dict, phone: str) -> dict:
 async def agent_turn(phone: str, text: str) -> None:
     s = session_for(phone)
     s["phone_full"] = phone          # used by tools that deliver directly (PDF)
-    history = s["messages"]
+
+    # Repair on load, so a session already poisoned in memory by an earlier
+    # bad trim heals itself instead of 400ing on every message until restart.
+    history = sanitize_history(s["messages"])
     history.append({"role": "user", "content": text})
     log.info("IN  %s %r", phone[-4:], text[:80])
 
@@ -1015,7 +1087,11 @@ async def agent_turn(phone: str, text: str) -> None:
                 temperature=0.6,
             )
         except Exception as e:
-            log.error("LLM error: %s", e)
+            # Log the payload too: without it a 400 about message shape is
+            # almost impossible to diagnose from the error string alone.
+            log.error("LLM error: %s | messages=%s",
+                      e, json.dumps(history, default=str)[:2000])
+            s["messages"] = trim_history(history)
             await send_message(phone, "Something went wrong on our end. "
                                       "Please try again in a moment.")
             return
@@ -1057,7 +1133,9 @@ async def agent_turn(phone: str, text: str) -> None:
         pending_links.clear()
         await send_message(phone, body)
 
-    s["messages"] = history[-MAX_HISTORY:]
+    # Trim to the window, then repair whatever the cut broke. A plain
+    # history[-MAX_HISTORY:] can orphan tool messages and poison the session.
+    s["messages"] = trim_history(history)
 
     if s.get("_end"):
         SESSIONS.pop(phone, None)
@@ -1108,12 +1186,8 @@ async def receive(request: Request, background: BackgroundTasks):
                  st.get("recipient_id"), st.get("id"), st.get("errors", ""))
 
     for msg in value.get("messages", []):
-        msg_id = msg.get("id")
-        if msg_id in PROCESSED_IDS:
+        if already_processed(msg.get("id")):
             continue
-        PROCESSED_IDS.add(msg_id)
-        if len(PROCESSED_IDS) > 1000:
-            PROCESSED_IDS.clear()
 
         if msg.get("type") == "text":
             text = (msg.get("text") or {}).get("body", "").strip()
@@ -1172,5 +1246,3 @@ async def assessment_completed(request: Request, background: BackgroundTasks):
     log.info("Report queued for %s (student %s)", phone[-4:],
              data.get("student_id"))
     return {"status": "ok"}
-
-    
