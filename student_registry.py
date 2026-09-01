@@ -94,7 +94,7 @@ class StudentRegistry:
             log.warning("Could not connect to platform for %s", formatted)
             self.last_error = "unreachable"
             return None
-        except Exception as e:
+        except Exception:
             log.exception("Lookup failed for %s", formatted)
             self.last_error = "error"
             return None
@@ -153,8 +153,12 @@ class StudentRegistry:
                 log.warning("Student %s has a level we can't map: %r",
                             s.get("id"), raw_level)
 
+            # Clean name: strip trailing " Last" or standalone "Last" returned by platform records
+            raw_name = s.get("name", "Unknown")
+            clean_name = re.sub(r"\bLast\b", "", raw_name, flags=re.IGNORECASE).strip() or raw_name
+
             result.append({
-                "name": s.get("name", "Unknown"),
+                "name": clean_name,
                 "primary_level": level,
                 "raw_level": raw_level,      # kept for debugging
                 "gender": s.get("gender") or "",
@@ -167,7 +171,7 @@ class StudentRegistry:
     # ------------------------------------------------------------ create
     def register_student(self, name: str, level: str, gender: str,
                          phone: str) -> dict | None:
-        """Register a new student.
+        """Register a new student on a first-name-only basis.
 
         Returns the created student dict, or None. On None, check
         `last_error`: "exists" means a 409, so the caller should re-run
@@ -177,10 +181,15 @@ class StudentRegistry:
         self.last_error = None
         formatted = self._format_phone(phone)
         level = normalize_level(level) or level
-        log.info("Registering %s (%s) on platform", name, level)
+        clean_name = name.strip()
 
+        log.info("Registering %s (%s) on platform", clean_name, level)
+
+        # Updated payload: Sends clean first name and explicitly empty last name
         payload = {
-            "name": name,
+            "name": clean_name,
+            "first_name": clean_name,
+            "last_name": "",
             "mobile": formatted,
             "level": level,
             "gender": (gender or "").lower(),
@@ -193,16 +202,17 @@ class StudentRegistry:
                 json=payload,
                 timeout=10,
             )
+            log.info("Create student platform response (%s): %s", response.status_code, response.text[:300])
         except requests.exceptions.Timeout:
-            log.warning("Registration timed out for %s", name)
+            log.warning("Registration timed out for %s", clean_name)
             self.last_error = "timeout"
             return None
         except requests.exceptions.ConnectionError:
-            log.warning("Could not connect to platform to register %s", name)
+            log.warning("Could not connect to platform to register %s", clean_name)
             self.last_error = "unreachable"
             return None
         except Exception:
-            log.exception("Registration failed for %s", name)
+            log.exception("Registration failed for %s", clean_name)
             self.last_error = "error"
             return None
 
@@ -212,7 +222,7 @@ class StudentRegistry:
         if problem:
             self.last_error = problem
             if problem == "exists":
-                log.info("%s already exists on the platform", name)
+                log.info("%s already exists on the platform", clean_name)
             return None
 
         if response.status_code not in (200, 201):
@@ -233,11 +243,15 @@ class StudentRegistry:
             self.last_error = "unexpected"
             return None
 
-        log.info("Registered %s as %s", name, student_id)
+        # Clean name returned by platform
+        returned_name = student.get("name") or clean_name
+        returned_name = re.sub(r"\bLast\b", "", returned_name, flags=re.IGNORECASE).strip() or clean_name
+
+        log.info("Registered %s as %s", returned_name, student_id)
         return {
             "student_id": student_id,
-            "name": student.get("name", name),
-            "full_name": student.get("full_name", ""),
+            "name": returned_name,
+            "full_name": returned_name,
             "phone": student.get("phone_number", phone),
             "gender": student.get("gender") or gender,
             "primary_level": normalize_level(level),
@@ -279,7 +293,6 @@ class StudentRegistry:
 
 
 if __name__ == "__main__":
-    
     cases = {
         "Primary 4": "Primary 4", "P4": "Primary 4", "p4": "Primary 4",
         "PRIMARY 4": "Primary 4", "Pri 4": "Primary 4", "4": "Primary 4",
