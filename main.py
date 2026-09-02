@@ -47,11 +47,23 @@ registry = StudentRegistry(
 
 DB_FILE = "students.json"
 
+# Set True once /generate-assessment is confirmed to accept question_count
+# and question_type. While False the bot still picks values internally but
+# does not promise them to the parent.
 SUPPORTS_QUESTION_OPTIONS = False
+
+# The platform's /generate-assessment now accepts is_offline (1 = PDF link,
+# 0 = online assessment link) per Dinesh, Aug 2026. Flip to False to switch
+# the PDF option off in chat without redeploying anything else.
 SUPPORTS_PDF = True
 
+# Report template (Meta > WhatsApp Manager > Message templates). The template
+# uses NAMED parameters ({{student_name}}, {{report_link}}), so sends must
+# name each parameter. Check the language code matches the approved template.
 REPORT_TEMPLATE_NAME = os.getenv("REPORT_TEMPLATE_NAME", "report_ready")
 REPORT_TEMPLATE_LANG = os.getenv("REPORT_TEMPLATE_LANG", "en")
+# Shared secret for the platform's report callback. Give the same value to
+# the platform team; requests without it are rejected.
 PLATFORM_CALLBACK_SECRET = os.getenv("PLATFORM_CALLBACK_SECRET")
 
 LEVEL_DEFAULTS = {
@@ -72,6 +84,9 @@ MAX_PROCESSED = 1000    # inbound message ids remembered for dedupe
 # phone -> {"messages": [...], "child": {...} | None, "topics": [...] }
 SESSIONS: dict[str, dict] = {}
 
+# Inbound ids already handled, so Meta's delivery retries don't double-reply.
+# The deque gives oldest-first eviction; clearing the whole set at a limit
+# would let a retry for a recent message slip through right after the wipe.
 PROCESSED_IDS: set[str] = set()
 PROCESSED_ORDER: deque[str] = deque(maxlen=MAX_PROCESSED)
 
@@ -83,7 +98,7 @@ def already_processed(msg_id: str) -> bool:
     if msg_id in PROCESSED_IDS:
         return True
     if len(PROCESSED_ORDER) == PROCESSED_ORDER.maxlen:
-        PROCESSED_IDS.discard(PROCESSED_ORDER[0])
+        PROCESSED_IDS.discard(PROCESSED_ORDER[0])   # evicted by the append below
     PROCESSED_ORDER.append(msg_id)
     PROCESSED_IDS.add(msg_id)
     return False
@@ -151,6 +166,12 @@ async def send_document(to: str, filepath: str, filename: str,
 
 async def send_report_template(to: str, student_name: str,
                                report_link: str) -> bool:
+    """Send the approved "report_ready" template.
+
+    Template messages are required here: the child may finish practice hours
+    after the parent's last message, outside WhatsApp's 24-hour service
+    window where free-form messages are rejected.
+    """
     payload = {
         "messaging_product": "whatsapp", "to": to, "type": "template",
         "template": {
@@ -490,36 +511,32 @@ Never ask two questions in one message.
 You never choose question count or question type. The system sets those \
 from the child's level. Do not mention them unless the parent asks.
 
-FLOW
-1. Call find_children first, every new conversation. It looks up by the \
-   parent's number automatically.
-2. If exactly one child comes back, greet them by name and carry on. \
-   If several, ask which one and call select_child. If none, you need the \
-   child's name, level and gender, then call register_child.
-3. Call list_topics before naming any topic. Never invent one.
-4. Confirm in one short line, then call create_practice.
-5. Send the link, then ask if there is anything else.
+FLOW & ONBOARDING
+1. Call find_children first on every new conversation to check if the parent \
+   is already registered.
+2. IF NO CHILDREN ARE FOUND (First-Time User):
+   - Welcome them warmly! Express genuine enthusiasm (e.g., "Welcome to WhatsPrep! 👋 \
+     Thank you so much for choosing us to help your child excel in Primary Maths.").
+   - Ask for their child's first name, primary level (P1-P6), and gender in a friendly, \
+     welcoming way so you can get them set up.
+   - Once provided, call register_child immediately.
+3. IF ONE CHILD IS FOUND:
+   - Greet them warmly back (e.g., "Welcome back! Ready to set up some Maths practice for Ayu? 😊").
+4. IF SEVERAL CHILDREN ARE FOUND:
+   - Ask which child they'd like to set up practice for and call select_child.
+5. Call list_topics before naming any topic. Never invent one.
+6. Confirm practice details in one short line, then call create_practice.
 
 STYLE
-Write like a helpful person texting. Short sentences, plain English, warm, \
-no markdown, no bullet characters, no headings. You may use emoticons to convey tone. Many parents are not \
-tech-savvy. One or two short messages, never a wall of text. When you list \
-topics, number them so a parent can reply with a number.
+Write like a warm, helpful, and encouraging educational assistant texting over WhatsApp. \
+Use friendly emojis naturally (😊, 👋, 📄, ⭐) to keep the tone welcoming. \
+Keep messages clear and concise (1-2 short paragraphs), never a heavy wall of text. \
+No markdown syntax (no asterisks, bolding, or square brackets).
 
 OFF-TOPIC AND SMALL TALK
 Reply like a person would: answer briefly and honestly, then offer what you \
 can actually do. Never fall back on a canned "I didn't catch that" when the \
 message was perfectly clear and simply not about practice.
-  "what's the time right now?"
-    -> "I can't check the time I'm afraid, but I can get some Maths practice
-        going for Ayu whenever you're ready."
-  "how are you?"
-    -> "Doing well, thanks! What should Ayu work on today?"
-  "can you help with science?"
-    -> "Only Maths at the moment, sorry. Want me to set up some Maths
-        practice instead?"
-Never claim an ability you do not have. You cannot browse, check the time, \
-send reminders, or see the child's homework. Say so plainly and move on.
 
 ADDING ANOTHER CHILD
 If a parent asks to add a student, they want to register another child. Ask \
@@ -532,18 +549,11 @@ says something unrelated, respond to what they actually said.
 
 WHEN A TOOL RETURNS AN ERROR
 Never invent a result and never carry on as if it worked. Each error carries \
-a "message" telling you what to do; follow it. In particular, if a lookup or \
-registration is unavailable, do NOT register anyone and do NOT offer to \
-generate practice. Apologise in one short line and ask them to try again in a \
-few minutes. If create_practice reports an unknown topic, use the valid list \
-it returns and pick again rather than guessing.
+a "message" telling you what to do; follow it.
 
 SAFETY
 Never ask for personal details beyond the child's first name, level and \
-gender. Never ask for an address, school, birth date or contact details. \
-If you are speaking with a child rather than a parent, stay on practice and \
-never suggest keeping anything from their parent. If the conversation moves \
-away from Maths practice, gently bring it back.
+gender. Never ask for an address, school, birth date or contact details.
 """
 
 # ---------------------------------------------------------------- tools
@@ -654,7 +664,7 @@ async def t_find_children(s: dict, phone: str) -> dict:
 
     if not found:
         return {"children": [],
-                "note": "No children registered to this number yet."}
+                "note": "No children registered to this number yet. Welcome them warmly to WhatsPrep!"}
 
     if len(found) == 1:
         s["child"] = found[0]
@@ -712,7 +722,7 @@ async def t_register_child(s: dict, name: str, level: str, gender: str) -> dict:
                         "student_id": str(match.get("student_id")),
                         "name": match.get("name"),
                         "level": match.get("primary_level"),
-                        "message": ("Already registered. Greet them by name and "
+                        "message": ("Already registered. Greet them by name warmly and "
                                     "carry on, do not mention the duplicate.")}
             return {"error": "ambiguous_existing",
                     "children": [{"student_id": str(c.get("student_id")),
@@ -742,7 +752,9 @@ async def t_register_child(s: dict, name: str, level: str, gender: str) -> dict:
     s["topics"] = []
     log.info("Registered new student %s (%s)", returned_name, student_id)
     return {"ok": True, "student_id": str(student_id),
-            "name": returned_name, "level": level}
+            "name": returned_name, "level": level,
+            "message": (f"Successfully registered {returned_name}! Welcome them warmly "
+                        "and ask what Maths topic they'd like to work on today.")}
 
 
 async def t_list_topics(s: dict) -> dict:
@@ -1100,6 +1112,12 @@ async def receive(request: Request, background: BackgroundTasks):
                 send_message, msg["from"],
                 "I can only read text at the moment. Tell me your child's level "
                 "and what they'd like to practise.")
+            continue
+
+        # Developer convenience reset command during testing
+        if text.lower() == "/reset":
+            SESSIONS.pop(msg["from"], None)
+            background.add_task(send_message, msg["from"], "Session reset! Send any message to start fresh.")
             continue
 
         if text:
