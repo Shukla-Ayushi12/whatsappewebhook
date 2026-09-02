@@ -47,23 +47,11 @@ registry = StudentRegistry(
 
 DB_FILE = "students.json"
 
-# Set True once /generate-assessment is confirmed to accept question_count
-# and question_type. While False the bot still picks values internally but
-# does not promise them to the parent.
 SUPPORTS_QUESTION_OPTIONS = False
-
-# The platform's /generate-assessment now accepts is_offline (1 = PDF link,
-# 0 = online assessment link) per Dinesh, Aug 2026. Flip to False to switch
-# the PDF option off in chat without redeploying anything else.
 SUPPORTS_PDF = True
 
-# Report template (Meta > WhatsApp Manager > Message templates). The template
-# uses NAMED parameters ({{student_name}}, {{report_link}}), so sends must
-# name each parameter. Check the language code matches the approved template.
 REPORT_TEMPLATE_NAME = os.getenv("REPORT_TEMPLATE_NAME", "report_ready")
 REPORT_TEMPLATE_LANG = os.getenv("REPORT_TEMPLATE_LANG", "en")
-# Shared secret for the platform's report callback. Give the same value to
-# the platform team; requests without it are rejected.
 PLATFORM_CALLBACK_SECRET = os.getenv("PLATFORM_CALLBACK_SECRET")
 
 LEVEL_DEFAULTS = {
@@ -84,9 +72,6 @@ MAX_PROCESSED = 1000    # inbound message ids remembered for dedupe
 # phone -> {"messages": [...], "child": {...} | None, "topics": [...] }
 SESSIONS: dict[str, dict] = {}
 
-# Inbound ids already handled, so Meta's delivery retries don't double-reply.
-# The deque gives oldest-first eviction; clearing the whole set at a limit
-# would let a retry for a recent message slip through right after the wipe.
 PROCESSED_IDS: set[str] = set()
 PROCESSED_ORDER: deque[str] = deque(maxlen=MAX_PROCESSED)
 
@@ -98,7 +83,7 @@ def already_processed(msg_id: str) -> bool:
     if msg_id in PROCESSED_IDS:
         return True
     if len(PROCESSED_ORDER) == PROCESSED_ORDER.maxlen:
-        PROCESSED_IDS.discard(PROCESSED_ORDER[0])   # evicted by the append below
+        PROCESSED_IDS.discard(PROCESSED_ORDER[0])
     PROCESSED_ORDER.append(msg_id)
     PROCESSED_IDS.add(msg_id)
     return False
@@ -166,12 +151,6 @@ async def send_document(to: str, filepath: str, filename: str,
 
 async def send_report_template(to: str, student_name: str,
                                report_link: str) -> bool:
-    """Send the approved "report_ready" template.
-
-    Template messages are required here: the child may finish practice hours
-    after the parent's last message, outside WhatsApp's 24-hour service
-    window where free-form messages are rejected.
-    """
     payload = {
         "messaging_product": "whatsapp", "to": to, "type": "template",
         "template": {
@@ -223,7 +202,7 @@ async def _watch_for_report(student_id: int, phone: str, student_name: str):
             new = [r for r in reports
                    if r.get("quiz_id_explico") not in known]
             if new:
-                latest = new[0]          # list is sorted newest first
+                latest = new[0]
                 ok = await send_report_template(
                     phone, student_name, latest.get("report_link", ""))
                 log.info("Report watcher fired for student %s (quiz %s): %s",
@@ -264,12 +243,17 @@ def load_database() -> list:
         return []
 
 
-def save_student_local(name, level, gender, phone, student_id):
-    clean_name = re.sub(r"\bLast\b", "", str(name), flags=re.IGNORECASE).strip()
+def save_student_local(first_name, last_name, level, gender, phone, student_id):
     students = load_database()
+    full_name = f"{first_name} {last_name}".strip()
     students.append({
-        "student_id": student_id, "name": clean_name, "primary_level": level,
-        "gender": gender, "phone": phone,
+        "student_id": student_id,
+        "first_name": first_name,
+        "last_name": last_name,
+        "name": full_name,
+        "primary_level": level,
+        "gender": gender,
+        "phone": phone,
         "joined_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
     })
     with open(DB_FILE, "w") as f:
@@ -283,7 +267,6 @@ def check_existing_student_local(phone: str) -> list | None:
             continue
         row = dict(s)
         row["primary_level"] = normalize_level(row.get("primary_level"))
-        row["name"] = re.sub(r"\bLast\b", "", str(row.get("name", "")), flags=re.IGNORECASE).strip()
         matches.append(row)
     return matches or None
 
@@ -471,7 +454,7 @@ back a link the child opens. Never write maths questions yourself.
 NEVER WRITE THE LINK YOURSELF
 The system appends the practice link to the end of your own message \
 automatically. If you also paste it, the parent gets it twice. Write one \
-short line like "Here's Ayu's practice on Angles, medium difficulty" and \
+short line like "Here's Dinesh's practice on Angles, medium difficulty" and \
 stop. Do not write the URL, do not write markdown links like [text](url), \
 and do not end with "here:" or "click this". WhatsApp shows markdown \
 literally, so never use square brackets, asterisks or backticks anywhere.
@@ -479,49 +462,27 @@ literally, so never use square brackets, asterisks or backticks anywhere.
 ONE PAPER, ALL TOPICS
 If a parent asks for several topics, pass them ALL in a single \
 create_practice call as one topic_ids list. The platform combines them into \
-one paper. Never call create_practice more than once for the same request, \
-it produces several separate papers and several links.
+one paper. Never call create_practice more than once for the same request.
 
 PDF OPTION
 If a parent asks for a printable paper, a PDF, or a hard copy, offer the \
-PDF version. Before generating, tell them plainly: the PDF comes with an \
-answer key, but it will NOT be marked by WhatsPrep and no \
-progress report will be sent - marking and reports only happen for practice \
-done through the link. If they confirm they want the PDF, call \
-create_practice_pdf with the same topic_ids and difficulty rules as \
-create_practice. The system sends the file itself; you just write one short \
-line after, like "Sent! Answer key is included for you." Never call \
-both create_practice and create_practice_pdf for the same request unless \
-the parent explicitly asks for both.
+PDF version. Tell them plainly: the PDF comes with an answer key, but it will \
+NOT be marked by WhatsPrep and no progress report will be sent. If they confirm, \
+call create_practice_pdf.
 
 REPORTS
-When a parent asks how their child did, for scores, results, or the report, \
-call get_report and share the latest report link in one short line. The \
-system also notifies parents automatically when a fresh report is ready, so \
-never promise to "send it later" yourself. If there are no reports yet, \
-explain the report appears after their child finishes a practice set.
-
-ASK AS FEW QUESTIONS AS POSSIBLE
-Read everything the parent gave you in one message and act on it. \
-"my girl is in p4, fractions are killing her" is enough to register or find \
-the child, pick the topic, infer a difficulty and confirm. Only ask for \
-something if it is genuinely missing and you cannot proceed without it. \
-Never ask two questions in one message.
-
-You never choose question count or question type. The system sets those \
-from the child's level. Do not mention them unless the parent asks.
+When a parent asks how their child did, call get_report and share the latest \
+report link in one short line.
 
 FLOW & ONBOARDING
 1. Call find_children first on every new conversation to check if the parent \
    is already registered.
 2. IF NO CHILDREN ARE FOUND (First-Time User):
-   - Welcome them warmly! Express genuine enthusiasm (e.g., "Welcome to WhatsPrep! 👋 \
-     Thank you so much for choosing us to help your child excel in Primary Maths.").
-   - Ask for their child's first name, primary level (P1-P6), and gender in a friendly, \
-     welcoming way so you can get them set up.
-   - Once provided, call register_child immediately.
+   - Welcome them warmly! (e.g., "Welcome to WhatsPrep! 👋 Thank you for choosing us to help your child excel in Primary Maths.").
+   - Ask for their child's FIRST NAME, LAST NAME, primary level (P1-P6), and gender so you can register them.
+   - Once provided, call register_child immediately with both first_name and last_name.
 3. IF ONE CHILD IS FOUND:
-   - Greet them warmly back (e.g., "Welcome back! Ready to set up some Maths practice for Ayu? 😊").
+   - Greet them warmly back (e.g., "Welcome back! Ready to set up Maths practice for Dinesh? 😊").
 4. IF SEVERAL CHILDREN ARE FOUND:
    - Ask which child they'd like to set up practice for and call select_child.
 5. Call list_topics before naming any topic. Never invent one.
@@ -529,33 +490,24 @@ FLOW & ONBOARDING
 
 STYLE
 Write like a warm, helpful, and encouraging educational assistant texting over WhatsApp. \
-VARY YOUR EMOJIS dynamically based on context—NEVER use the same emoji twice in a row, \
-and NEVER repeatedly use 😋. Use diverse emojis naturally (e.g. 👋, ✨, 📚, 🎯, 📄, 👍, ⭐, 😊) \
-or omit emojis entirely when not needed. \
+VARY YOUR EMOJIS dynamically—never use the same emoji repeatedly. Use diverse emojis \
+naturally (e.g. 👋, ✨, 📚, 🎯, 📄, 👍, ⭐, 😊) or omit emojis when not needed. \
 Keep messages clear and concise (1-2 short paragraphs), never a heavy wall of text. \
 No markdown syntax (no asterisks, bolding, or square brackets).
 
 OFF-TOPIC AND SMALL TALK
-Reply like a person would: answer briefly and honestly, then offer what you \
-can actually do. Never fall back on a canned "I didn't catch that" when the \
-message was perfectly clear and simply not about practice.
+Reply like a person would: answer briefly and honestly, then offer what you can do.
 
 ADDING ANOTHER CHILD
-If a parent asks to add a student, they want to register another child. Ask \
-for the name, level and gender in one message, then call register_child. Do \
-not show them a topic list.
-
-ASKING AGAIN
-Only say you did not understand when you genuinely did not. If a parent \
-says something unrelated, respond to what they actually said.
+If a parent asks to add a student, ask for the first name, last name, level, and gender \
+in one message, then call register_child.
 
 WHEN A TOOL RETURNS AN ERROR
-Never invent a result and never carry on as if it worked. Each error carries \
-a "message" telling you what to do; follow it.
+Never invent a result. Follow the tool's error message.
 
 SAFETY
-Never ask for personal details beyond the child's first name, level and \
-gender. Never ask for an address, school, birth date or contact details.
+Never ask for personal details beyond the child's name, level and gender. \
+Never ask for address, school, or birth dates.
 """
 
 # ---------------------------------------------------------------- tools
@@ -576,13 +528,14 @@ TOOLS = [
     }},
     {"type": "function", "function": {
         "name": "register_child",
-        "description": ("Register a new child. Only call once you have the name, "
-                        "level and gender, and the parent has confirmed them."),
+        "description": ("Register a new child. Only call once you have the first_name, "
+                        "last_name, level, and gender."),
         "parameters": {"type": "object", "properties": {
-            "name": {"type": "string", "description": "First name, capitalised"},
+            "first_name": {"type": "string", "description": "Child's first name"},
+            "last_name": {"type": "string", "description": "Child's last name or surname"},
             "level": {"type": "string", "enum": LEVELS},
             "gender": {"type": "string", "enum": ["Male", "Female"]}},
-            "required": ["name", "level", "gender"]},
+            "required": ["first_name", "last_name", "level", "gender"]},
     }},
     {"type": "function", "function": {
         "name": "list_topics",
@@ -599,41 +552,26 @@ TOOLS = [
     {"type": "function", "function": {
         "name": "create_practice",
         "description": ("Generate the practice set and return its link. Call only "
-                        "after confirming with the parent. Question count and type "
-                        "are set by the system."),
+                        "after confirming with the parent."),
         "parameters": {"type": "object", "properties": {
             "topic_ids": {"type": "array", "items": {"type": "string"},
-                          "description": ("ALL requested topic_ids from list_topics, in "
-                                          "one list. e.g. topics 2, 5 and 6 becomes "
-                                          "[\"2\",\"5\",\"6\"], not three calls.")},
-            "subtopic_id": {"type": "string",
-                            "description": "Optional, only if one was chosen"},
+                          "description": "ALL requested topic_ids from list_topics in one list."},
+            "subtopic_id": {"type": "string", "description": "Optional subtopic_id"},
             "difficulty": {"type": "string", "enum": ["Easy", "Medium", "Hard"]}},
             "required": ["topic_ids", "difficulty"]},
     }},
     {"type": "function", "function": {
         "name": "create_practice_pdf",
-        "description": ("Generate a printable PDF paper with an answer key, "
-                        "delivered as a WhatsApp document. PDF papers "
-                        "are NOT marked and produce NO report. Only call after the "
-                        "parent has confirmed they want the PDF and you have told "
-                        "them it will not be marked. The system sends the file "
-                        "itself; do not describe a link."),
+        "description": "Generate a printable PDF paper delivered as a WhatsApp document.",
         "parameters": {"type": "object", "properties": {
-            "topic_ids": {"type": "array", "items": {"type": "string"},
-                          "description": ("ALL requested topic_ids from list_topics, "
-                                          "in one list, same rule as create_practice.")},
-            "subtopic_id": {"type": "string",
-                            "description": "Optional, only if one was chosen"},
+            "topic_ids": {"type": "array", "items": {"type": "string"}},
+            "subtopic_id": {"type": "string"},
             "difficulty": {"type": "string", "enum": ["Easy", "Medium", "Hard"]}},
             "required": ["topic_ids", "difficulty"]},
     }},
     {"type": "function", "function": {
         "name": "get_report",
-        "description": ("Fetch the child's completed practice reports. Call when "
-                        "the parent asks how their child did, for results, scores, "
-                        "or the report. Returns the latest report link, which the "
-                        "system appends to your message automatically."),
+        "description": "Fetch the child's completed practice reports.",
         "parameters": {"type": "object", "properties": {}},
     }},
     {"type": "function", "function": {
@@ -673,6 +611,8 @@ async def t_find_children(s: dict, phone: str) -> dict:
         s["topics"] = []
 
     return {"children": [{"student_id": str(c.get("student_id", "")),
+                          "first_name": c.get("first_name", ""),
+                          "last_name": c.get("last_name", ""),
                           "name": c.get("name", ""),
                           "level": c.get("primary_level", "")} for c in found],
             "auto_selected": len(found) == 1}
@@ -688,30 +628,34 @@ async def t_select_child(s: dict, student_id: str) -> dict:
         if str(c.get("student_id")) == str(student_id):
             s["child"] = c
             s["topics"] = []
-            return {"ok": True, "name": c.get("name"),
+            return {"ok": True, "name": c.get("name") or c.get("first_name"),
                     "level": c.get("primary_level")}
     return {"error": "not_found",
             "message": "That child is not registered to this number."}
 
 
-async def t_register_child(s: dict, name: str, level: str, gender: str) -> dict:
+async def t_register_child(s: dict, first_name: str, last_name: str, level: str, gender: str) -> dict:
     level = normalize_level(level)
     if not level:
         return {"error": "bad_level", "valid": LEVELS,
                 "message": "Ask which primary level, 1 to 6."}
 
-    clean_name = name.strip()
+    clean_first = first_name.strip()
+    clean_last = last_name.strip()
+    full_name = f"{clean_first} {clean_last}".strip()
     phone = s.get("phone_local", "")
+
     new = await asyncio.to_thread(registry.register_student,
-                                  clean_name, level, gender, phone)
+                                  clean_first, clean_last, level, gender, phone)
     err = registry.last_error
 
     if not new and err == "exists":
-        log.info("409 for %s, re-querying to adopt the existing record", clean_name)
+        log.info("409 for %s, re-querying to adopt existing record", full_name)
         existing = await asyncio.to_thread(registry.check_student_exists, phone)
         if not registry.last_error and existing:
             match = next((c for c in existing
-                          if c.get("name", "").strip().lower() == clean_name.lower()),
+                          if c.get("first_name", "").strip().lower() == clean_first.lower() and
+                          c.get("last_name", "").strip().lower() == clean_last.lower()),
                          None)
             if match is None and len(existing) == 1:
                 match = existing[0]
@@ -722,7 +666,7 @@ async def t_register_child(s: dict, name: str, level: str, gender: str) -> dict:
                          match.get("name"), match.get("student_id"))
                 return {"ok": True, "already_existed": True,
                         "student_id": str(match.get("student_id")),
-                        "name": match.get("name"),
+                        "name": match.get("name") or full_name,
                         "level": match.get("primary_level"),
                         "message": ("Already registered. Greet them by name warmly and "
                                     "carry on, do not mention the duplicate.")}
@@ -733,29 +677,33 @@ async def t_register_child(s: dict, name: str, level: str, gender: str) -> dict:
                                  for c in existing],
                     "message": "Already registered. Ask which child this is."}
         return {"error": "exists_but_unreadable",
-                "message": ("That child already exists but the records are "
-                            "unreachable. Apologise and ask them to try shortly.")}
+                "message": ("That child already exists but records are unreachable.")}
 
     if not new:
-        log.error("Registration failed for %s (%s)", clean_name, err)
-        save_student_local(clean_name, level, gender, phone,
+        log.error("Registration failed for %s (%s)", full_name, err)
+        save_student_local(clean_first, clean_last, level, gender, phone,
                            f"S{datetime.now().strftime('%Y%m%d%H%M%S')}")
         return {"error": "registration_unavailable", "reason": err,
-                "message": ("Could not reach the student records. Their details "
-                            "are saved. Apologise and ask them to try again in a "
-                            "few minutes. Do not offer practice yet.")}
+                "message": ("Could not reach student records. Details saved locally. "
+                            "Apologise and ask them to try again shortly.")}
 
     student_id = new.get("student_id", "")
-    save_student_local(clean_name, level, gender, phone, student_id)
+    save_student_local(clean_first, clean_last, level, gender, phone, student_id)
 
-    returned_name = new.get("name", clean_name)
-    s["child"] = {"student_id": student_id, "name": returned_name,
-                  "primary_level": level, "gender": gender, "phone": phone}
+    s["child"] = {
+        "student_id": student_id,
+        "first_name": clean_first,
+        "last_name": clean_last,
+        "name": new.get("name") or full_name,
+        "primary_level": level,
+        "gender": gender,
+        "phone": phone
+    }
     s["topics"] = []
-    log.info("Registered new student %s (%s)", returned_name, student_id)
+    log.info("Registered new student %s (%s)", full_name, student_id)
     return {"ok": True, "student_id": str(student_id),
-            "name": returned_name, "level": level,
-            "message": (f"Successfully registered {returned_name}! Welcome them warmly "
+            "name": clean_first, "full_name": full_name, "level": level,
+            "message": (f"Successfully registered {full_name}! Welcome them warmly "
                         "and ask what Maths topic they'd like to work on today.")}
 
 
@@ -765,8 +713,7 @@ async def t_list_topics(s: dict) -> dict:
     if not usable_student_id(s["child"].get("student_id")):
         return {"error": "child_not_on_platform",
                 "message": ("This child was saved locally during an outage and "
-                            "is not on the platform yet. Apologise and ask them "
-                            "to try again shortly.")}
+                            "is not on the platform yet. Ask them to try again shortly.")}
     if not s.get("topics"):
         s["topics"] = await asyncio.to_thread(
             _get_topics, s["child"].get("student_id")) or []
@@ -796,7 +743,7 @@ def _validate_practice_request(s: dict, topic_ids: list, difficulty: str):
     if not usable_student_id(s["child"].get("student_id")):
         return {"error": "child_not_on_platform",
                 "message": ("Not on the platform yet, so practice cannot be "
-                            "generated. Apologise and ask them to try shortly.")}
+                            "generated. Ask them to try again shortly.")}
     if difficulty not in DIFFICULTY_EMOJI:
         return {"error": "bad_difficulty", "valid": list(DIFFICULTY_EMOJI)}
     return None
@@ -828,8 +775,8 @@ async def t_create_practice(s: dict, topic_ids: list, difficulty: str,
     child = s["child"]
     level = normalize_level(child.get("primary_level", ""))
     if not level:
-        log.warning("No usable level for student %s (raw=%r), using generic paper",
-                    child.get("student_id"), child.get("raw_level"))
+        log.warning("No usable level for student %s, using generic paper",
+                    child.get("student_id"))
     picked = defaults_for(level, difficulty)
     ids = [subtopic_id] if subtopic_id else list(map(str, topic_ids))
 
@@ -842,13 +789,13 @@ async def t_create_practice(s: dict, topic_ids: list, difficulty: str,
                 "message": "Could not generate just now, ask them to try again."}
 
     phone = s.get("phone_full", "")
+    student_display_name = child.get("first_name") or child.get("name") or "Your child"
     if phone:
-        start_report_watch(child.get("student_id"), phone,
-                           child.get("name") or "Your child")
+        start_report_watch(child.get("student_id"), phone, student_display_name)
 
     return {"link": url, "difficulty": difficulty,
             "emoji": DIFFICULTY_EMOJI.get(difficulty, ""),
-            "child": child.get("name")}
+            "child": student_display_name}
 
 
 async def t_create_practice_pdf(s: dict, topic_ids: list, difficulty: str,
@@ -859,9 +806,7 @@ async def t_create_practice_pdf(s: dict, topic_ids: list, difficulty: str,
 
     if not SUPPORTS_PDF:
         return {"error": "pdf_unavailable",
-                "message": ("PDF papers are switched off right now. Apologise in "
-                            "one short line and offer the normal practice link "
-                            "instead.")}
+                "message": ("PDF papers are switched off right now. Offer normal practice link.")}
 
     err = await _validate_topics(s, topic_ids)
     if err:
@@ -884,10 +829,9 @@ async def t_create_practice_pdf(s: dict, topic_ids: list, difficulty: str,
         picked["count"], picked["type"], 1)
     if not url:
         return {"error": "generation_failed",
-                "message": ("Could not generate the PDF just now. Offer the "
-                            "normal practice link instead.")}
+                "message": ("Could not generate the PDF just now. Offer practice link instead.")}
 
-    name = (child.get("name") or "Practice").strip()
+    name = (child.get("first_name") or child.get("name") or "Practice").strip()
     safe_name = re.sub(r"[^A-Za-z0-9 _-]", "", name) or "Practice"
     filename = f"{safe_name} - {level} {difficulty} Practice.pdf"
     caption = (f"{name}'s practice paper. PDF papers aren't marked and "
@@ -905,9 +849,7 @@ async def t_create_practice_pdf(s: dict, topic_ids: list, difficulty: str,
                 f.write(r.content)
             delivered = await send_document(phone, tmp.name, filename, caption)
         else:
-            log.info("PDF url did not serve a raw pdf (status %s, type %s); "
-                     "falling back to link", r.status_code,
-                     r.headers.get("content-type"))
+            log.info("PDF url did not serve raw pdf, falling back to link")
     except Exception:
         log.exception("PDF fetch/send failed; falling back to link")
     finally:
@@ -916,16 +858,11 @@ async def t_create_practice_pdf(s: dict, topic_ids: list, difficulty: str,
 
     if delivered:
         return {"ok": True, "delivered": "pdf_document", "child": name,
-                "message": ("PDF sent as a document in the chat. Confirm in one "
-                            "short line and remind them PDF papers are not "
-                            "marked and no report will come.")}
+                "message": ("PDF sent as a document in the chat.")}
 
     return {"link": url, "delivered": "pdf_link", "child": name,
             "difficulty": difficulty,
-            "message": ("Could not attach the file directly, so the PDF "
-                        "download link will be added to your message. Say the "
-                        "paper is ready to download, and remind them it is "
-                        "not marked.")}
+            "message": ("PDF download link appended to your message.")}
 
 
 async def t_get_report(s: dict) -> dict:
@@ -933,28 +870,21 @@ async def t_get_report(s: dict) -> dict:
         return {"error": "no_child", "message": "Select or register a child first."}
     if not usable_student_id(s["child"].get("student_id")):
         return {"error": "child_not_on_platform",
-                "message": ("Not on the platform yet. Apologise and ask them "
-                            "to try again shortly.")}
+                "message": ("Not on platform yet. Apologise and ask them to try shortly.")}
     reports = await asyncio.to_thread(
         _get_student_reports, s["child"].get("student_id"))
     if reports is None:
         return {"error": "unavailable",
-                "message": "Reports could not be loaded right now. Apologise "
-                           "and ask them to try again in a few minutes."}
+                "message": "Reports could not be loaded right now."}
     if not reports:
         return {"reports": 0,
-                "note": ("No completed practice yet. Tell them the report "
-                         "appears here once their child finishes a practice "
-                         "set through the link.")}
+                "note": ("No completed practice yet. Tell them the report appears after completion.")}
     latest = reports[0]
     return {"link": latest.get("report_link"),
             "title": latest.get("homework_quiz_title"),
             "total_reports": len(reports),
-            "child": s["child"].get("name"),
-            "message": ("Latest report found. Write one short line like "
-                        "\'Here\'s how NAME did on their latest practice\' - "
-                        "the link is appended automatically, never write it "
-                        "yourself.")}
+            "child": s["child"].get("first_name") or s["child"].get("name"),
+            "message": ("Latest report found. Write one short line; link is appended automatically.")}
 
 
 async def t_end_conversation(s: dict) -> dict:
@@ -1013,8 +943,7 @@ async def agent_turn(phone: str, text: str) -> None:
             log.error("LLM error: %s | messages=%s",
                       e, json.dumps(history, default=str)[:2000])
             s["messages"] = trim_history(history)
-            await send_message(phone, "Something went wrong on our end. "
-                                      "Please try again in a moment.")
+            await send_message(phone, "Something went wrong on our end. Please try again.")
             return
 
         msg = resp.choices[0].message
@@ -1116,7 +1045,6 @@ async def receive(request: Request, background: BackgroundTasks):
                 "and what they'd like to practise.")
             continue
 
-        # Developer convenience reset command during testing
         if text.lower() == "/reset":
             SESSIONS.pop(msg["from"], None)
             background.add_task(send_message, msg["from"], "Session reset! Send any message to start fresh.")
@@ -1132,7 +1060,7 @@ async def receive(request: Request, background: BackgroundTasks):
 async def assessment_completed(request: Request, background: BackgroundTasks):
     if not PLATFORM_CALLBACK_SECRET or \
             request.headers.get("X-Callback-Secret") != PLATFORM_CALLBACK_SECRET:
-        log.warning("Rejected report callback (bad or missing secret)")
+        log.warning("Rejected report callback (bad secret)")
         return Response(status_code=403)
 
     try:
@@ -1144,16 +1072,11 @@ async def assessment_completed(request: Request, background: BackgroundTasks):
     if phone and not phone.startswith("65"):
         phone = "65" + phone
     student_name = (data.get("student_name") or "").strip() or "Your child"
-    student_name = re.sub(r"\bLast\b", "", student_name, flags=re.IGNORECASE).strip() or "Your child"
     report_link = (data.get("report_link") or "").strip()
 
     if not phone or not report_link:
-        log.warning("Report callback missing phone or report_link: %s",
-                    {k: data.get(k) for k in ("student_id", "phone",
-                                              "report_link")})
         return {"status": "ignored", "reason": "missing phone or report_link"}
 
     background.add_task(send_report_template, phone, student_name, report_link)
-    log.info("Report queued for %s (student %s)", phone[-4:],
-             data.get("student_id"))
+    log.info("Report queued for %s (student %s)", phone[-4:], data.get("student_id"))
     return {"status": "ok"}
