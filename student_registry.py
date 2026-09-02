@@ -46,6 +46,15 @@ class StudentRegistry:
     def _format_phone(phone: str) -> str:
         return f"+65{phone}" if not str(phone).startswith("+") else str(phone)
 
+    @staticmethod
+    def _normalize_gender(gender: str) -> str:
+        g = str(gender or "").strip().lower()
+        if g in ("male", "boy", "guy", "m"):
+            return "male"
+        if g in ("female", "girl", "f"):
+            return "female"
+        return g
+
     def _classify(self, response) -> str | None:
         """Map a response onto a last_error value. None means it's usable."""
         if "<!DOCTYPE html>" in response.text[:200]:
@@ -153,46 +162,50 @@ class StudentRegistry:
                 log.warning("Student %s has a level we can't map: %r",
                             s.get("id"), raw_level)
 
-            # Clean name: strip trailing " Last" or standalone "Last" returned by platform records
-            raw_name = s.get("name", "Unknown")
-            clean_name = re.sub(r"\bLast\b", "", raw_name, flags=re.IGNORECASE).strip() or raw_name
+            first_name = (s.get("first_name") or "").strip()
+            last_name = (s.get("last_name") or "").strip()
+            
+            full_name = s.get("name") or f"{first_name} {last_name}".strip() or "Unknown"
 
             result.append({
-                "name": clean_name,
+                "student_id": s.get("id", ""),
+                "first_name": first_name,
+                "last_name": last_name,
+                "name": full_name,
                 "primary_level": level,
-                "raw_level": raw_level,      # kept for debugging
+                "raw_level": raw_level,
                 "gender": s.get("gender") or "",
                 "phone": phone,
-                "student_id": s.get("id", ""),
             })
         log.info("Parsed %d student record(s)", len(result))
         return result
 
     # ------------------------------------------------------------ create
-    def register_student(self, name: str, level: str, gender: str,
-                         phone: str) -> dict | None:
-        """Register a new student on a first-name-only basis.
+    def register_student(self, first_name: str, last_name: str, level: str,
+                         gender: str, phone: str) -> dict | None:
+        """Register a new student using first name and last name.
 
         Returns the created student dict, or None. On None, check
         `last_error`: "exists" means a 409, so the caller should re-run
-        check_student_exists and adopt the existing record rather than
-        inventing a local id.
+        check_student_exists and adopt the existing record.
         """
         self.last_error = None
         formatted = self._format_phone(phone)
         level = normalize_level(level) or level
-        clean_name = name.strip()
 
-        log.info("Registering %s (%s) on platform", clean_name, level)
+        clean_first = first_name.strip()
+        clean_last = last_name.strip()
+        clean_gender = self._normalize_gender(gender)
+        full_name = f"{clean_first} {clean_last}".strip()
 
-        # Updated payload: Sends clean first name and explicitly empty last name
+        log.info("Registering %s (%s) on platform", full_name, level)
+
         payload = {
-            "name": clean_name,
-            "first_name": clean_name,
-            "last_name": "",
+            "first_name": clean_first,
+            "last_name": clean_last,
             "mobile": formatted,
             "level": level,
-            "gender": (gender or "").lower(),
+            "gender": clean_gender,
         }
 
         try:
@@ -204,15 +217,15 @@ class StudentRegistry:
             )
             log.info("Create student platform response (%s): %s", response.status_code, response.text[:300])
         except requests.exceptions.Timeout:
-            log.warning("Registration timed out for %s", clean_name)
+            log.warning("Registration timed out for %s", full_name)
             self.last_error = "timeout"
             return None
         except requests.exceptions.ConnectionError:
-            log.warning("Could not connect to platform to register %s", clean_name)
+            log.warning("Could not connect to platform to register %s", full_name)
             self.last_error = "unreachable"
             return None
         except Exception:
-            log.exception("Registration failed for %s", clean_name)
+            log.exception("Registration failed for %s", full_name)
             self.last_error = "error"
             return None
 
@@ -222,7 +235,7 @@ class StudentRegistry:
         if problem:
             self.last_error = problem
             if problem == "exists":
-                log.info("%s already exists on the platform", clean_name)
+                log.info("%s already exists on the platform", full_name)
             return None
 
         if response.status_code not in (200, 201):
@@ -243,17 +256,18 @@ class StudentRegistry:
             self.last_error = "unexpected"
             return None
 
-        # Clean name returned by platform
-        returned_name = student.get("name") or clean_name
-        returned_name = re.sub(r"\bLast\b", "", returned_name, flags=re.IGNORECASE).strip() or clean_name
+        returned_first = student.get("first_name") or clean_first
+        returned_last = student.get("last_name") or clean_last
+        returned_full = student.get("name") or f"{returned_first} {returned_last}".strip()
 
-        log.info("Registered %s as %s", returned_name, student_id)
+        log.info("Registered %s as %s", returned_full, student_id)
         return {
             "student_id": student_id,
-            "name": returned_name,
-            "full_name": returned_name,
+            "first_name": returned_first,
+            "last_name": returned_last,
+            "name": returned_full,
             "phone": student.get("phone_number", phone),
-            "gender": student.get("gender") or gender,
+            "gender": student.get("gender") or clean_gender,
             "primary_level": normalize_level(level),
             "raw_level": level,
             "created_at": student.get("created_at", ""),
