@@ -529,7 +529,9 @@ FLOW & ONBOARDING
 
 STYLE
 Write like a warm, helpful, and encouraging educational assistant texting over WhatsApp. \
-Use friendly emojis naturally (😊, 👋, 📄, ⭐) to keep the tone welcoming. \
+VARY YOUR EMOJIS dynamically based on context—NEVER use the same emoji twice in a row, \
+and NEVER repeatedly use 😋. Use diverse emojis naturally (e.g. 👋, ✨, 📚, 🎯, 📄, 👍, ⭐, 😊) \
+or omit emojis entirely when not needed. \
 Keep messages clear and concise (1-2 short paragraphs), never a heavy wall of text. \
 No markdown syntax (no asterisks, bolding, or square brackets).
 
@@ -1005,7 +1007,7 @@ async def agent_turn(phone: str, text: str) -> None:
                 model=MODEL,
                 messages=[{"role": "system", "content": SYSTEM_PROMPT}] + history,
                 tools=TOOLS,
-                temperature=0.6,
+                temperature=0.7,
             )
         except Exception as e:
             log.error("LLM error: %s | messages=%s",
