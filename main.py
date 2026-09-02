@@ -204,12 +204,6 @@ async def send_report_template(to: str, student_name: str,
 
 
 # ------------------------------------------------------- report watcher
-# The platform has no completion callback; it only offers a pull API. After
-# each generated practice we poll /student-reports in the background and send
-# the report_ready template when a NEW report shows up. One watcher per
-# student at a time; a new practice replaces the old watcher.
-# NOTE: watchers live in this process. A restart or (on free hosting) a
-# spin-down kills them - another reason to run an always-on instance.
 REPORT_WATCHES: dict[int, asyncio.Task] = {}
 REPORT_WATCH_INTERVAL = 300        # seconds between polls
 REPORT_WATCH_LIFETIME = 6 * 3600   # give up after 6 hours
@@ -253,9 +247,6 @@ def start_report_watch(student_id, phone: str, student_name: str):
     old = REPORT_WATCHES.get(sid)
     if old and not old.done():
         old.cancel()
-    # Called from inside the running loop, so create_task is the correct call.
-    # asyncio.get_event_loop() is deprecated and its behaviour inside a running
-    # loop has shifted between Python versions.
     REPORT_WATCHES[sid] = asyncio.create_task(
         _watch_for_report(sid, phone, student_name))
     log.info("Report watcher started for student %s", sid)
@@ -274,9 +265,10 @@ def load_database() -> list:
 
 
 def save_student_local(name, level, gender, phone, student_id):
+    clean_name = re.sub(r"\bLast\b", "", str(name), flags=re.IGNORECASE).strip()
     students = load_database()
     students.append({
-        "student_id": student_id, "name": name, "primary_level": level,
+        "student_id": student_id, "name": clean_name, "primary_level": level,
         "gender": gender, "phone": phone,
         "joined_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
     })
@@ -285,24 +277,18 @@ def save_student_local(name, level, gender, phone, student_id):
 
 
 def check_existing_student_local(phone: str) -> list | None:
-    """Local cache. Only used when the platform is unreachable.
-
-    Rows written by the degraded path carry an "S..." id, which the platform
-    endpoints cannot use, so they are normalised here and filtered at the
-    point of use rather than silently failing later.
-    """
     matches = []
     for s in load_database():
         if s.get("phone", "").lstrip("+65") != phone:
             continue
         row = dict(s)
         row["primary_level"] = normalize_level(row.get("primary_level"))
+        row["name"] = re.sub(r"\bLast\b", "", str(row.get("name", "")), flags=re.IGNORECASE).strip()
         matches.append(row)
     return matches or None
 
 
 def usable_student_id(student_id) -> bool:
-    """Platform ids are numeric. Local fallback ids look like S20260731...."""
     try:
         int(student_id)
         return True
@@ -311,8 +297,6 @@ def usable_student_id(student_id) -> bool:
 
 
 # ---------------------------------------------------------------- platform api
-# Sync `requests` calls are wrapped in asyncio.to_thread at the call site so
-# they don't block the event loop.
 def _get_topics(student_id, subject: str = "Math") -> list | None:
     try:
         sid = int(student_id)
@@ -360,14 +344,11 @@ def _get_subtopics(student_id, topic_id) -> list | None:
 
 def _generate_worksheet_url(student_id, topic_ids, difficulty,
                             count=None, qtype=None, is_offline: int = 0) -> str | None:
-    """is_offline=0 -> online assessment link. is_offline=1 -> PDF link.
-    (Platform update Aug 2026: same endpoint, new request-body field.)"""
     try:
         sid = int(student_id)
         tids = [int(t) for t in topic_ids]
     except (ValueError, TypeError):
         return None
-    # Platform update (Aug 2026) documents lowercase difficulty ("easy").
     payload = {"topic_ids": tids, "student_id": sid,
                "difficulty": str(difficulty).lower(),
                "is_offline": is_offline}
@@ -398,11 +379,6 @@ def _generate_worksheet_url(student_id, topic_ids, difficulty,
 
 
 def _get_student_reports(student_id) -> list | None:
-    """Completed-assessment reports for a student, newest first.
-
-    POST /student-reports {"student_id": N} ->
-      data: [{quiz_id_explico, homework_quiz_title, report_link}, ...]
-    """
     try:
         sid = int(student_id)
     except (ValueError, TypeError):
@@ -416,8 +392,6 @@ def _get_student_reports(student_id) -> list | None:
         )
         if r.status_code == 200:
             data = r.json().get("data") or []
-            # Defensive ordering: quiz ids increase over time, so sort
-            # descending instead of trusting response order.
             data = [d for d in data if d.get("report_link")]
             data.sort(key=lambda d: d.get("quiz_id_explico") or 0, reverse=True)
             log.info("Reports for student %s: %d", sid, len(data))
@@ -434,13 +408,6 @@ _BARE_LINK = re.compile(r"https?://\S*whatsprep\.com\S*")
 
 
 def clean_reply(text: str) -> str:
-    """Strip practice links out of the model's prose.
-
-    The link is sent as its own message so WhatsApp renders a preview card.
-    If the model also writes it into its text the parent sees it twice, and
-    markdown link syntax shows up literally because WhatsApp does not render
-    it. The prompt asks the model not to do this; this is the safety net.
-    """
     if not text:
         return text
     text = _MD_LINK.sub(r"\1", text)
@@ -459,24 +426,13 @@ def session_for(phone: str) -> dict:
 
 
 # ------------------------------------------------------- history integrity
-# OpenAI rejects any `tool` message that is not immediately preceded by the
-# assistant message whose `tool_calls` it answers:
-#   400 - messages with role 'tool' must be a response to a preceeding
-#         message with 'tool_calls'
-# A plain `history[-MAX_HISTORY:]` can cut between an assistant tool-call
-# message and its replies, orphaning them. Once an orphan sits at the front
-# of a session's history, EVERY later request in that session fails until the
-# process restarts. So: slice first, then repair, and repair again on load so
-# an already-poisoned in-memory session heals itself.
-
 def sanitize_history(messages: list) -> list:
-    """Drop orphaned tool messages and tool_calls whose replies are missing."""
     out, i, n = [], 0, len(messages)
     while i < n:
         m = messages[i]
         role = m.get("role")
 
-        if role == "tool":                      # no parent tool_calls: drop it
+        if role == "tool":
             i += 1
             continue
 
@@ -488,9 +444,8 @@ def sanitize_history(messages: list) -> list:
                     replies.append(messages[j])
                 j += 1
             if {r.get("tool_call_id") for r in replies} == ids:
-                out.append(m)                   # complete pair: keep together
+                out.append(m)
                 out.extend(replies)
-            # incomplete: drop the call and its partial replies entirely
             i = j
             continue
 
@@ -500,7 +455,6 @@ def sanitize_history(messages: list) -> list:
 
 
 def trim_history(messages: list, keep: int = MAX_HISTORY) -> list:
-    """Slice to the window, then repair whatever the slice broke."""
     return sanitize_history(messages[-keep:])
 
 
@@ -557,36 +511,32 @@ Never ask two questions in one message.
 You never choose question count or question type. The system sets those \
 from the child's level. Do not mention them unless the parent asks.
 
-FLOW
-1. Call find_children first, every new conversation. It looks up by the \
-   parent's number automatically.
-2. If exactly one child comes back, greet them by name and carry on. \
-   If several, ask which one and call select_child. If none, you need the \
-   child's name, level and gender, then call register_child.
-3. Call list_topics before naming any topic. Never invent one.
-4. Confirm in one short line, then call create_practice.
-5. Send the link, then ask if there is anything else.
+FLOW & ONBOARDING
+1. Call find_children first on every new conversation to check if the parent \
+   is already registered.
+2. IF NO CHILDREN ARE FOUND (First-Time User):
+   - Welcome them warmly! Express genuine enthusiasm (e.g., "Welcome to WhatsPrep! 👋 \
+     Thank you so much for choosing us to help your child excel in Primary Maths.").
+   - Ask for their child's first name, primary level (P1-P6), and gender in a friendly, \
+     welcoming way so you can get them set up.
+   - Once provided, call register_child immediately.
+3. IF ONE CHILD IS FOUND:
+   - Greet them warmly back (e.g., "Welcome back! Ready to set up some Maths practice for Ayu? 😊").
+4. IF SEVERAL CHILDREN ARE FOUND:
+   - Ask which child they'd like to set up practice for and call select_child.
+5. Call list_topics before naming any topic. Never invent one.
+6. Confirm practice details in one short line, then call create_practice.
 
 STYLE
-Write like a helpful person texting. Short sentences, plain English, warm, \
-no markdown, no bullet characters, no headings. You may use emoticons to convey tone. Many parents are not \
-tech-savvy. One or two short messages, never a wall of text. When you list \
-topics, number them so a parent can reply with a number.
+Write like a warm, helpful, and encouraging educational assistant texting over WhatsApp. \
+Use friendly emojis naturally (😊, 👋, 📄, ⭐) to keep the tone welcoming. \
+Keep messages clear and concise (1-2 short paragraphs), never a heavy wall of text. \
+No markdown syntax (no asterisks, bolding, or square brackets).
 
 OFF-TOPIC AND SMALL TALK
 Reply like a person would: answer briefly and honestly, then offer what you \
 can actually do. Never fall back on a canned "I didn't catch that" when the \
 message was perfectly clear and simply not about practice.
-  "what's the time right now?"
-    -> "I can't check the time I'm afraid, but I can get some Maths practice
-        going for Ayu whenever you're ready."
-  "how are you?"
-    -> "Doing well, thanks! What should Ayu work on today?"
-  "can you help with science?"
-    -> "Only Maths at the moment, sorry. Want me to set up some Maths
-        practice instead?"
-Never claim an ability you do not have. You cannot browse, check the time, \
-send reminders, or see the child's homework. Say so plainly and move on.
 
 ADDING ANOTHER CHILD
 If a parent asks to add a student, they want to register another child. Ask \
@@ -599,18 +549,11 @@ says something unrelated, respond to what they actually said.
 
 WHEN A TOOL RETURNS AN ERROR
 Never invent a result and never carry on as if it worked. Each error carries \
-a "message" telling you what to do; follow it. In particular, if a lookup or \
-registration is unavailable, do NOT register anyone and do NOT offer to \
-generate practice. Apologise in one short line and ask them to try again in a \
-few minutes. If create_practice reports an unknown topic, use the valid list \
-it returns and pick again rather than guessing.
+a "message" telling you what to do; follow it.
 
 SAFETY
 Never ask for personal details beyond the child's first name, level and \
-gender. Never ask for an address, school, birth date or contact details. \
-If you are speaking with a child rather than a parent, stay on practice and \
-never suggest keeping anything from their parent. If the conversation moves \
-away from Maths practice, gently bring it back.
+gender. Never ask for an address, school, birth date or contact details.
 """
 
 # ---------------------------------------------------------------- tools
@@ -700,9 +643,6 @@ TOOLS = [
 
 
 # ---------------------------------------------------------------- tool impls
-# Every tool reads the phone and active child from the session, never from
-# model arguments. The model cannot address another parent's children.
-
 async def t_find_children(s: dict, phone: str) -> dict:
     local = phone[2:] if phone.startswith("65") else phone
     s["phone_local"] = local
@@ -710,8 +650,6 @@ async def t_find_children(s: dict, phone: str) -> dict:
     found = await asyncio.to_thread(registry.check_student_exists, local)
     err = registry.last_error
 
-    # The lookup FAILED. Never treat this as "new parent" or we register a
-    # duplicate child every time the platform blips or the JWT expires.
     if err:
         cached = check_existing_student_local(local)
         if cached:
@@ -724,11 +662,9 @@ async def t_find_children(s: dict, phone: str) -> dict:
                                 "Do NOT register anyone. Apologise briefly and "
                                 "ask them to try again in a few minutes.")}
 
-    # The lookup SUCCEEDED and returned nothing. Any local row here is a
-    # leftover from a failed registration and has an unusable id, so ignore it.
     if not found:
         return {"children": [],
-                "note": "No children registered to this number yet."}
+                "note": "No children registered to this number yet. Welcome them warmly to WhatsPrep!"}
 
     if len(found) == 1:
         s["child"] = found[0]
@@ -762,19 +698,18 @@ async def t_register_child(s: dict, name: str, level: str, gender: str) -> dict:
         return {"error": "bad_level", "valid": LEVELS,
                 "message": "Ask which primary level, 1 to 6."}
 
+    clean_name = name.strip()
     phone = s.get("phone_local", "")
     new = await asyncio.to_thread(registry.register_student,
-                                  name, level, gender, phone)
+                                  clean_name, level, gender, phone)
     err = registry.last_error
 
-    # 409: they already exist on the platform. Adopt the real record rather
-    # than minting a local id that can never generate a worksheet.
     if not new and err == "exists":
-        log.info("409 for %s, re-querying to adopt the existing record", name)
+        log.info("409 for %s, re-querying to adopt the existing record", clean_name)
         existing = await asyncio.to_thread(registry.check_student_exists, phone)
         if not registry.last_error and existing:
             match = next((c for c in existing
-                          if c.get("name", "").strip().lower() == name.strip().lower()),
+                          if c.get("name", "").strip().lower() == clean_name.lower()),
                          None)
             if match is None and len(existing) == 1:
                 match = existing[0]
@@ -787,7 +722,7 @@ async def t_register_child(s: dict, name: str, level: str, gender: str) -> dict:
                         "student_id": str(match.get("student_id")),
                         "name": match.get("name"),
                         "level": match.get("primary_level"),
-                        "message": ("Already registered. Greet them by name and "
+                        "message": ("Already registered. Greet them by name warmly and "
                                     "carry on, do not mention the duplicate.")}
             return {"error": "ambiguous_existing",
                     "children": [{"student_id": str(c.get("student_id")),
@@ -799,11 +734,9 @@ async def t_register_child(s: dict, name: str, level: str, gender: str) -> dict:
                 "message": ("That child already exists but the records are "
                             "unreachable. Apologise and ask them to try shortly.")}
 
-    # Any other failure. Keep the details locally so nothing is lost, but do
-    # NOT set the active child: a local id cannot generate a worksheet.
     if not new:
-        log.error("Registration failed for %s (%s)", name, err)
-        save_student_local(name, level, gender, phone,
+        log.error("Registration failed for %s (%s)", clean_name, err)
+        save_student_local(clean_name, level, gender, phone,
                            f"S{datetime.now().strftime('%Y%m%d%H%M%S')}")
         return {"error": "registration_unavailable", "reason": err,
                 "message": ("Could not reach the student records. Their details "
@@ -811,13 +744,17 @@ async def t_register_child(s: dict, name: str, level: str, gender: str) -> dict:
                             "few minutes. Do not offer practice yet.")}
 
     student_id = new.get("student_id", "")
-    save_student_local(name, level, gender, phone, student_id)
-    s["child"] = {"student_id": student_id, "name": name,
+    save_student_local(clean_name, level, gender, phone, student_id)
+
+    returned_name = new.get("name", clean_name)
+    s["child"] = {"student_id": student_id, "name": returned_name,
                   "primary_level": level, "gender": gender, "phone": phone}
     s["topics"] = []
-    log.info("Registered new student %s (%s)", name, student_id)
+    log.info("Registered new student %s (%s)", returned_name, student_id)
     return {"ok": True, "student_id": str(student_id),
-            "name": name, "level": level}
+            "name": returned_name, "level": level,
+            "message": (f"Successfully registered {returned_name}! Welcome them warmly "
+                        "and ask what Maths topic they'd like to work on today.")}
 
 
 async def t_list_topics(s: dict) -> dict:
@@ -852,11 +789,6 @@ async def t_list_subtopics(s: dict, topic_id: str) -> dict:
 
 
 def _validate_practice_request(s: dict, topic_ids: list, difficulty: str):
-    """Shared guards for create_practice and create_practice_pdf.
-
-    Returns an error dict, or None if the request is valid. Fills the
-    session topic cache as a side effect (needed for validation anyway).
-    """
     if not s.get("child"):
         return {"error": "no_child", "message": "Select or register a child first."}
     if not usable_student_id(s["child"].get("student_id")):
@@ -869,7 +801,6 @@ def _validate_practice_request(s: dict, topic_ids: list, difficulty: str):
 
 
 async def _validate_topics(s: dict, topic_ids: list):
-    """Topic-id check against the real list. Models occasionally invent one."""
     if not s.get("topics"):
         s["topics"] = await asyncio.to_thread(
             _get_topics, s["child"].get("student_id")) or []
@@ -908,8 +839,6 @@ async def t_create_practice(s: dict, topic_ids: list, difficulty: str,
         return {"error": "generation_failed",
                 "message": "Could not generate just now, ask them to try again."}
 
-    # Watch for the completed report and push the report_ready template
-    # when it appears. Online practice only; PDFs are not marked.
     phone = s.get("phone_full", "")
     if phone:
         start_report_watch(child.get("student_id"), phone,
@@ -946,12 +875,11 @@ async def t_create_practice_pdf(s: dict, topic_ids: list, difficulty: str,
     picked = defaults_for(level, difficulty)
     ids = [subtopic_id] if subtopic_id else list(map(str, topic_ids))
 
-    # Generation takes a few seconds; say so instead of going silent.
     await send_message(phone, "Putting the paper together now, one moment 📄")
 
     url = await asyncio.to_thread(
         _generate_worksheet_url, child.get("student_id"), ids, difficulty,
-        picked["count"], picked["type"], 1)          # is_offline=1 -> PDF
+        picked["count"], picked["type"], 1)
     if not url:
         return {"error": "generation_failed",
                 "message": ("Could not generate the PDF just now. Offer the "
@@ -963,9 +891,6 @@ async def t_create_practice_pdf(s: dict, topic_ids: list, difficulty: str,
     caption = (f"{name}'s practice paper. PDF papers aren't marked and "
                "don't count towards reports.")
 
-    # Best delivery: fetch the file and send it as a real WhatsApp document,
-    # so the paper sits in the chat ready to print. If anything about the
-    # download looks off, fall back to handing over the link.
     tmp = tempfile.NamedTemporaryFile(suffix=".pdf", delete=False)
     tmp.close()
     delivered = False
@@ -993,8 +918,6 @@ async def t_create_practice_pdf(s: dict, topic_ids: list, difficulty: str,
                             "short line and remind them PDF papers are not "
                             "marked and no report will come.")}
 
-    # Fallback: the download link is appended to your message automatically,
-    # same as a normal practice link. Do not write the URL yourself.
     return {"link": url, "delivered": "pdf_link", "child": name,
             "difficulty": difficulty,
             "message": ("Could not attach the file directly, so the PDF "
@@ -1068,10 +991,8 @@ async def run_tool(name: str, args: dict, s: dict, phone: str) -> dict:
 # ---------------------------------------------------------------- agent loop
 async def agent_turn(phone: str, text: str) -> None:
     s = session_for(phone)
-    s["phone_full"] = phone          # used by tools that deliver directly (PDF)
+    s["phone_full"] = phone
 
-    # Repair on load, so a session already poisoned in memory by an earlier
-    # bad trim heals itself instead of 400ing on every message until restart.
     history = sanitize_history(s["messages"])
     history.append({"role": "user", "content": text})
     log.info("IN  %s %r", phone[-4:], text[:80])
@@ -1087,8 +1008,6 @@ async def agent_turn(phone: str, text: str) -> None:
                 temperature=0.6,
             )
         except Exception as e:
-            # Log the payload too: without it a 400 about message shape is
-            # almost impossible to diagnose from the error string alone.
             log.error("LLM error: %s | messages=%s",
                       e, json.dumps(history, default=str)[:2000])
             s["messages"] = trim_history(history)
@@ -1100,8 +1019,6 @@ async def agent_turn(phone: str, text: str) -> None:
         history.append(msg.model_dump(exclude_none=True))
 
         if not msg.tool_calls:
-            # One message: the model's line, then the link on its own row.
-            # WhatsApp renders the preview card from the URL in the same bubble.
             body = clean_reply(msg.content or "")
             if pending_links:
                 body = (body + "\n\n" + "\n".join(pending_links)).strip()
@@ -1126,15 +1043,12 @@ async def agent_turn(phone: str, text: str) -> None:
                 if link not in pending_links:
                     pending_links.append(link)
     else:
-        # Ran out of tool hops without a final reply. Still hand over any link.
         body = "Sorry, I got a bit stuck there. Could you tell me that again?"
         if pending_links:
             body = ("Here's the practice.\n\n" + "\n".join(pending_links))
         pending_links.clear()
         await send_message(phone, body)
 
-    # Trim to the window, then repair whatever the cut broke. A plain
-    # history[-MAX_HISTORY:] can orphan tool messages and poison the session.
     s["messages"] = trim_history(history)
 
     if s.get("_end"):
@@ -1145,7 +1059,6 @@ async def agent_turn(phone: str, text: str) -> None:
 
 # ---------------------------------------------------------------- webhook
 def verify_signature(body: bytes, header: str | None) -> bool:
-    """Reject unsigned webhook POSTs."""
     if not APP_SECRET:
         log.warning("META_APP_SECRET not set — signature check skipped")
         return True
@@ -1201,6 +1114,12 @@ async def receive(request: Request, background: BackgroundTasks):
                 "and what they'd like to practise.")
             continue
 
+        # Developer convenience reset command during testing
+        if text.lower() == "/reset":
+            SESSIONS.pop(msg["from"], None)
+            background.add_task(send_message, msg["from"], "Session reset! Send any message to start fresh.")
+            continue
+
         if text:
             background.add_task(agent_turn, msg["from"], text)
 
@@ -1209,17 +1128,6 @@ async def receive(request: Request, background: BackgroundTasks):
 
 @app.post("/assessment-completed")
 async def assessment_completed(request: Request, background: BackgroundTasks):
-    """Called by the WhatsPrep platform when a child finishes an assessment.
-
-    Expected JSON body (agree the exact shape with the platform team):
-      {
-        "student_id": 5,
-        "student_name": "Chloe",
-        "phone": "6591234567",      # parent's WhatsApp number
-        "report_link": "https://app.whatsprep.com/report/..."
-      }
-    Requires header X-Callback-Secret matching PLATFORM_CALLBACK_SECRET.
-    """
     if not PLATFORM_CALLBACK_SECRET or \
             request.headers.get("X-Callback-Secret") != PLATFORM_CALLBACK_SECRET:
         log.warning("Rejected report callback (bad or missing secret)")
@@ -1234,6 +1142,7 @@ async def assessment_completed(request: Request, background: BackgroundTasks):
     if phone and not phone.startswith("65"):
         phone = "65" + phone
     student_name = (data.get("student_name") or "").strip() or "Your child"
+    student_name = re.sub(r"\bLast\b", "", student_name, flags=re.IGNORECASE).strip() or "Your child"
     report_link = (data.get("report_link") or "").strip()
 
     if not phone or not report_link:
