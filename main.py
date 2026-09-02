@@ -534,7 +534,11 @@ TOOLS = [
             "first_name": {"type": "string", "description": "Child's first name"},
             "last_name": {"type": "string", "description": "Child's last name or surname"},
             "level": {"type": "string", "enum": LEVELS},
-            "gender": {"type": "string", "enum": ["Male", "Female"]}},
+           "gender": {
+    "type": "string",
+    "enum": ["Male", "Female"],
+    "description": "Child's gender: 'Male' (for boy, guy) or 'Female' (for girl)"
+}
             "required": ["first_name", "last_name", "level", "gender"]},
     }},
     {"type": "function", "function": {
@@ -644,6 +648,12 @@ async def t_register_child(s: dict, first_name: str, last_name: str, level: str,
     clean_last = last_name.strip()
     full_name = f"{clean_first} {clean_last}".strip()
     phone = s.get("phone_local", "")
+    # Inside t_register_child in main.py:
+raw_g = (gender or "").strip().lower()
+gender_clean = "Male" if raw_g in ("male", "boy", "guy", "m") else ("Female" if raw_g in ("female", "girl", "f") else gender)
+
+new = await asyncio.to_thread(registry.register_student,
+                              clean_first, clean_last, level, gender_clean, phone)
 
     new = await asyncio.to_thread(registry.register_student,
                                   clean_first, clean_last, level, gender, phone)
