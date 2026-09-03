@@ -71,7 +71,6 @@ MAX_PROCESSED = 1000    # inbound message ids remembered for dedupe
 
 # phone -> {"messages": [...], "child": {...} | None, "topics": [...] }
 SESSIONS: dict[str, dict] = {}
-
 PROCESSED_IDS: set[str] = set()
 PROCESSED_ORDER: deque[str] = deque(maxlen=MAX_PROCESSED)
 
@@ -151,6 +150,7 @@ async def send_document(to: str, filepath: str, filename: str,
 
 async def send_report_template(to: str, student_name: str,
                                report_link: str) -> bool:
+    """Send the approved report_ready template (named parameters)."""
     payload = {
         "messaging_product": "whatsapp", "to": to, "type": "template",
         "template": {
@@ -183,6 +183,11 @@ async def send_report_template(to: str, student_name: str,
 
 
 # ------------------------------------------------------- report watcher
+# The platform has no completion callback, only a pull API. After each
+# generated practice we poll /student-reports in the background and send the
+# report_ready template when a NEW report shows up. One watcher per student;
+# a new practice replaces the old watcher. Watchers live in this process:
+# a restart or spin-down kills them, so run an always-on instance.
 REPORT_WATCHES: dict[int, asyncio.Task] = {}
 REPORT_WATCH_INTERVAL = 300        # seconds between polls
 REPORT_WATCH_LIFETIME = 6 * 3600   # give up after 6 hours
@@ -202,7 +207,7 @@ async def _watch_for_report(student_id: int, phone: str, student_name: str):
             new = [r for r in reports
                    if r.get("quiz_id_explico") not in known]
             if new:
-                latest = new[0]
+                latest = new[0]          # list is sorted newest first
                 ok = await send_report_template(
                     phone, student_name, latest.get("report_link", ""))
                 log.info("Report watcher fired for student %s (quiz %s): %s",
@@ -260,10 +265,18 @@ def save_student_local(first_name, last_name, level, gender, phone, student_id):
         json.dump(students, f, indent=4)
 
 
+def _local_phone(phone: str) -> str:
+    """Normalise a stored phone to its local (no +65) form."""
+    p = re.sub(r"\D", "", str(phone or ""))
+    if p.startswith("65") and len(p) > 8:
+        p = p[2:]
+    return p
+
+
 def check_existing_student_local(phone: str) -> list | None:
     matches = []
     for s in load_database():
-        if s.get("phone", "").lstrip("+65") != phone:
+        if _local_phone(s.get("phone", "")) != _local_phone(phone):
             continue
         row = dict(s)
         row["primary_level"] = normalize_level(row.get("primary_level"))
@@ -272,6 +285,7 @@ def check_existing_student_local(phone: str) -> list | None:
 
 
 def usable_student_id(student_id) -> bool:
+    """Platform ids are numeric. Local fallback ids look like S20260731...."""
     try:
         int(student_id)
         return True
@@ -327,6 +341,7 @@ def _get_subtopics(student_id, topic_id) -> list | None:
 
 def _generate_worksheet_url(student_id, topic_ids, difficulty,
                             count=None, qtype=None, is_offline: int = 0) -> str | None:
+    """is_offline=0 -> online assessment link. is_offline=1 -> PDF link."""
     try:
         sid = int(student_id)
         tids = [int(t) for t in topic_ids]
@@ -362,6 +377,7 @@ def _generate_worksheet_url(student_id, topic_ids, difficulty,
 
 
 def _get_student_reports(student_id) -> list | None:
+    """Completed-assessment reports for a student, newest first."""
     try:
         sid = int(student_id)
     except (ValueError, TypeError):
@@ -410,15 +426,15 @@ def session_for(phone: str) -> dict:
 
 # ------------------------------------------------------- history integrity
 def sanitize_history(messages: list) -> list:
+    """Drop orphaned tool messages / incomplete tool-call groups so the
+    OpenAI API never rejects a resubmitted history."""
     out, i, n = [], 0, len(messages)
     while i < n:
         m = messages[i]
         role = m.get("role")
-
         if role == "tool":
             i += 1
             continue
-
         if role == "assistant" and m.get("tool_calls"):
             ids = {tc.get("id") for tc in m["tool_calls"]}
             j, replies = i + 1, []
@@ -431,7 +447,6 @@ def sanitize_history(messages: list) -> list:
                 out.extend(replies)
             i = j
             continue
-
         out.append(m)
         i += 1
     return out
@@ -467,47 +482,56 @@ one paper. Never call create_practice more than once for the same request.
 PDF OPTION
 If a parent asks for a printable paper, a PDF, or a hard copy, offer the \
 PDF version. Tell them plainly: the PDF comes with an answer key, but it will \
-NOT be marked by WhatsPrep and no progress report will be sent. If they confirm, \
-call create_practice_pdf.
+NOT be marked by WhatsPrep and no progress report will be sent. If they \
+confirm, call create_practice_pdf.
 
 REPORTS
 When a parent asks how their child did, call get_report and share the latest \
-report link in one short line.
+report link in one short line. The system also notifies parents \
+automatically when a fresh report is ready.
 
 FLOW & ONBOARDING
 1. Call find_children first on every new conversation to check if the parent \
    is already registered.
 2. IF NO CHILDREN ARE FOUND (First-Time User):
-   - Welcome them warmly! (e.g., "Welcome to WhatsPrep! 👋 Thank you for choosing us to help your child excel in Primary Maths.").
-   - Ask for their child's FIRST NAME, LAST NAME, primary level (P1-P6), and gender so you can register them.
-   - Once provided, call register_child immediately with both first_name and last_name.
+   - Welcome them warmly (e.g. "Welcome to WhatsPrep! 👋 Thank you for \
+choosing us to help your child excel in Primary Maths.").
+   - Ask for their child's FIRST NAME, LAST NAME, primary level (P1-P6), \
+and gender so you can register them.
+   - Once provided, call register_child immediately with both first_name \
+and last_name.
 3. IF ONE CHILD IS FOUND:
-   - Greet them warmly back (e.g., "Welcome back! Ready to set up Maths practice for Dinesh? 😊").
+   - Greet them warmly back (e.g. "Welcome back! Ready to set up Maths \
+practice for Dinesh? 😊").
 4. IF SEVERAL CHILDREN ARE FOUND:
    - Ask which child they'd like to set up practice for and call select_child.
 5. Call list_topics before naming any topic. Never invent one.
 6. Confirm practice details in one short line, then call create_practice.
 
 STYLE
-Write like a warm, helpful, and encouraging educational assistant texting over WhatsApp. \
-VARY YOUR EMOJIS dynamically—never use the same emoji repeatedly. Use diverse emojis \
-naturally (e.g. 👋, ✨, 📚, 🎯, 📄, 👍, ⭐, 😊) or omit emojis when not needed. \
-Keep messages clear and concise (1-2 short paragraphs), never a heavy wall of text. \
-No markdown syntax (no asterisks, bolding, or square brackets).
+Write like a warm, helpful, and encouraging educational assistant texting \
+over WhatsApp. VARY YOUR EMOJIS dynamically - never use the same emoji \
+repeatedly. Use diverse emojis naturally (e.g. 👋, ✨, 📚, 🎯, 📄, 👍, ⭐, 😊) \
+or omit emojis when not needed. Keep messages clear and concise (1-2 short \
+paragraphs), never a heavy wall of text. No markdown syntax (no asterisks, \
+bolding, or square brackets).
 
 OFF-TOPIC AND SMALL TALK
-Reply like a person would: answer briefly and honestly, then offer what you can do.
+Reply like a person would: answer briefly and honestly, then offer what you \
+can do.
 
 ADDING ANOTHER CHILD
-If a parent asks to add a student, ask for the first name, last name, level, and gender \
-in one message, then call register_child.
+If a parent asks to add a student, ask for the first name, last name, level, \
+and gender in one message, then call register_child.
 
 WHEN A TOOL RETURNS AN ERROR
 Never invent a result. Follow the tool's error message.
 
 SAFETY
 Never ask for personal details beyond the child's name, level and gender. \
-Never ask for address, school, or birth dates.
+Never ask for address, school, or birth dates. If you are speaking with a \
+child rather than a parent, stay on practice and never suggest keeping \
+anything from their parent.
 """
 
 # ---------------------------------------------------------------- tools
@@ -528,17 +552,16 @@ TOOLS = [
     }},
     {"type": "function", "function": {
         "name": "register_child",
-        "description": ("Register a new child. Only call once you have the first_name, "
-                        "last_name, level, and gender."),
+        "description": ("Register a new child. Only call once you have the "
+                        "first_name, last_name, level, and gender."),
         "parameters": {"type": "object", "properties": {
             "first_name": {"type": "string", "description": "Child's first name"},
-            "last_name": {"type": "string", "description": "Child's last name or surname"},
+            "last_name": {"type": "string",
+                          "description": "Child's last name or surname"},
             "level": {"type": "string", "enum": LEVELS},
-           "gender": {
-    "type": "string",
-    "enum": ["Male", "Female"],
-    "description": "Child's gender: 'Male' (for boy, guy) or 'Female' (for girl)"
-}
+            "gender": {"type": "string", "enum": ["Male", "Female"],
+                       "description": ("Child's gender: Male (for boy) or "
+                                       "Female (for girl)")}},
             "required": ["first_name", "last_name", "level", "gender"]},
     }},
     {"type": "function", "function": {
@@ -559,14 +582,17 @@ TOOLS = [
                         "after confirming with the parent."),
         "parameters": {"type": "object", "properties": {
             "topic_ids": {"type": "array", "items": {"type": "string"},
-                          "description": "ALL requested topic_ids from list_topics in one list."},
+                          "description": ("ALL requested topic_ids from "
+                                          "list_topics in one list.")},
             "subtopic_id": {"type": "string", "description": "Optional subtopic_id"},
             "difficulty": {"type": "string", "enum": ["Easy", "Medium", "Hard"]}},
             "required": ["topic_ids", "difficulty"]},
     }},
     {"type": "function", "function": {
         "name": "create_practice_pdf",
-        "description": "Generate a printable PDF paper delivered as a WhatsApp document.",
+        "description": ("Generate a printable PDF paper delivered as a WhatsApp "
+                        "document. Not marked, no report. Only after the parent "
+                        "confirms they want the PDF."),
         "parameters": {"type": "object", "properties": {
             "topic_ids": {"type": "array", "items": {"type": "string"}},
             "subtopic_id": {"type": "string"},
@@ -587,6 +613,9 @@ TOOLS = [
 
 
 # ---------------------------------------------------------------- tool impls
+# Tools read the phone and active child from the session, never from model
+# arguments, so the model cannot address another parent's children.
+
 async def t_find_children(s: dict, phone: str) -> dict:
     local = phone[2:] if phone.startswith("65") else phone
     s["phone_local"] = local
@@ -594,6 +623,7 @@ async def t_find_children(s: dict, phone: str) -> dict:
     found = await asyncio.to_thread(registry.check_student_exists, local)
     err = registry.last_error
 
+    # Lookup FAILED (never treat as "new parent" or we mint duplicates).
     if err:
         cached = check_existing_student_local(local)
         if cached:
@@ -608,7 +638,8 @@ async def t_find_children(s: dict, phone: str) -> dict:
 
     if not found:
         return {"children": [],
-                "note": "No children registered to this number yet. Welcome them warmly to WhatsPrep!"}
+                "note": ("No children registered to this number yet. "
+                         "Welcome them warmly to WhatsPrep!")}
 
     if len(found) == 1:
         s["child"] = found[0]
@@ -638,35 +669,61 @@ async def t_select_child(s: dict, student_id: str) -> dict:
             "message": "That child is not registered to this number."}
 
 
-async def t_register_child(s: dict, first_name: str, last_name: str, level: str, gender: str) -> dict:
+def _register_student_compat(first_name: str, last_name: str, level: str,
+                             gender: str, phone: str):
+    """Call registry.register_student, tolerating either signature.
+
+    Preferred (new) signature: (first_name, last_name, level, gender, phone).
+    If student_registry.py still has the old 4-arg (name, level, gender,
+    phone) signature, fall back to it with the combined name so registration
+    keeps working until that file is updated too.
+    """
+    try:
+        return registry.register_student(first_name, last_name, level,
+                                         gender, phone)
+    except TypeError:
+        log.warning("registry.register_student rejected 5 args; falling back "
+                    "to legacy (name, level, gender, phone). Update "
+                    "student_registry.py to accept first/last name.")
+        full_name = f"{first_name} {last_name}".strip()
+        return registry.register_student(full_name, level, gender, phone)
+
+
+async def t_register_child(s: dict, first_name: str, last_name: str,
+                           level: str, gender: str) -> dict:
     level = normalize_level(level)
     if not level:
         return {"error": "bad_level", "valid": LEVELS,
                 "message": "Ask which primary level, 1 to 6."}
 
-    clean_first = first_name.strip()
-    clean_last = last_name.strip()
+    clean_first = (first_name or "").strip()
+    clean_last = (last_name or "").strip()
+    if not clean_first:
+        return {"error": "bad_name",
+                "message": "Ask for the child's first name."}
     full_name = f"{clean_first} {clean_last}".strip()
     phone = s.get("phone_local", "")
-    # Inside t_register_child in main.py:
-raw_g = (gender or "").strip().lower()
-gender_clean = "Male" if raw_g in ("male", "boy", "guy", "m") else ("Female" if raw_g in ("female", "girl", "f") else gender)
 
-new = await asyncio.to_thread(registry.register_student,
-                              clean_first, clean_last, level, gender_clean, phone)
+    # Normalise gender so "boy"/"girl"/"m"/"f" all map to what the API expects.
+    raw_g = (gender or "").strip().lower()
+    gender = ("Male" if raw_g in ("male", "boy", "guy", "m")
+              else "Female" if raw_g in ("female", "girl", "f") else gender)
 
-    new = await asyncio.to_thread(registry.register_student,
+    new = await asyncio.to_thread(_register_student_compat,
                                   clean_first, clean_last, level, gender, phone)
     err = registry.last_error
 
+    # 409: already on the platform. Adopt the real record.
     if not new and err == "exists":
         log.info("409 for %s, re-querying to adopt existing record", full_name)
         existing = await asyncio.to_thread(registry.check_student_exists, phone)
         if not registry.last_error and existing:
-            match = next((c for c in existing
-                          if c.get("first_name", "").strip().lower() == clean_first.lower() and
-                          c.get("last_name", "").strip().lower() == clean_last.lower()),
-                         None)
+            match = next(
+                (c for c in existing
+                 if (c.get("first_name", "").strip().lower() == clean_first.lower()
+                     and c.get("last_name", "").strip().lower() == clean_last.lower())
+                 or c.get("name", "").strip().lower() == full_name.lower()),
+                None)
             if match is None and len(existing) == 1:
                 match = existing[0]
             if match:
@@ -678,8 +735,9 @@ new = await asyncio.to_thread(registry.register_student,
                         "student_id": str(match.get("student_id")),
                         "name": match.get("name") or full_name,
                         "level": match.get("primary_level"),
-                        "message": ("Already registered. Greet them by name warmly and "
-                                    "carry on, do not mention the duplicate.")}
+                        "message": ("Already registered. Greet them by name "
+                                    "warmly and carry on, do not mention the "
+                                    "duplicate.")}
             return {"error": "ambiguous_existing",
                     "children": [{"student_id": str(c.get("student_id")),
                                   "name": c.get("name"),
@@ -687,19 +745,23 @@ new = await asyncio.to_thread(registry.register_student,
                                  for c in existing],
                     "message": "Already registered. Ask which child this is."}
         return {"error": "exists_but_unreadable",
-                "message": ("That child already exists but records are unreachable.")}
+                "message": ("That child already exists but records are "
+                            "unreachable. Apologise and ask them to try "
+                            "shortly.")}
 
+    # Other failure: save locally, but do NOT set the active child (a local
+    # id cannot generate a worksheet).
     if not new:
         log.error("Registration failed for %s (%s)", full_name, err)
         save_student_local(clean_first, clean_last, level, gender, phone,
                            f"S{datetime.now().strftime('%Y%m%d%H%M%S')}")
         return {"error": "registration_unavailable", "reason": err,
-                "message": ("Could not reach student records. Details saved locally. "
-                            "Apologise and ask them to try again shortly.")}
+                "message": ("Could not reach student records. Details saved "
+                            "locally. Apologise and ask them to try again "
+                            "shortly. Do not offer practice yet.")}
 
     student_id = new.get("student_id", "")
     save_student_local(clean_first, clean_last, level, gender, phone, student_id)
-
     s["child"] = {
         "student_id": student_id,
         "first_name": clean_first,
@@ -707,14 +769,15 @@ new = await asyncio.to_thread(registry.register_student,
         "name": new.get("name") or full_name,
         "primary_level": level,
         "gender": gender,
-        "phone": phone
+        "phone": phone,
     }
     s["topics"] = []
     log.info("Registered new student %s (%s)", full_name, student_id)
     return {"ok": True, "student_id": str(student_id),
             "name": clean_first, "full_name": full_name, "level": level,
-            "message": (f"Successfully registered {full_name}! Welcome them warmly "
-                        "and ask what Maths topic they'd like to work on today.")}
+            "message": (f"Successfully registered {full_name}! Welcome them "
+                        "warmly and ask what Maths topic they'd like to work "
+                        "on today.")}
 
 
 async def t_list_topics(s: dict) -> dict:
@@ -723,7 +786,8 @@ async def t_list_topics(s: dict) -> dict:
     if not usable_student_id(s["child"].get("student_id")):
         return {"error": "child_not_on_platform",
                 "message": ("This child was saved locally during an outage and "
-                            "is not on the platform yet. Ask them to try again shortly.")}
+                            "is not on the platform yet. Ask them to try again "
+                            "shortly.")}
     if not s.get("topics"):
         s["topics"] = await asyncio.to_thread(
             _get_topics, s["child"].get("student_id")) or []
@@ -798,6 +862,7 @@ async def t_create_practice(s: dict, topic_ids: list, difficulty: str,
         return {"error": "generation_failed",
                 "message": "Could not generate just now, ask them to try again."}
 
+    # Watch for the completed report; online practice only (PDFs unmarked).
     phone = s.get("phone_full", "")
     student_display_name = child.get("first_name") or child.get("name") or "Your child"
     if phone:
@@ -816,7 +881,8 @@ async def t_create_practice_pdf(s: dict, topic_ids: list, difficulty: str,
 
     if not SUPPORTS_PDF:
         return {"error": "pdf_unavailable",
-                "message": ("PDF papers are switched off right now. Offer normal practice link.")}
+                "message": ("PDF papers are switched off right now. Offer the "
+                            "normal practice link instead.")}
 
     err = await _validate_topics(s, topic_ids)
     if err:
@@ -836,10 +902,11 @@ async def t_create_practice_pdf(s: dict, topic_ids: list, difficulty: str,
 
     url = await asyncio.to_thread(
         _generate_worksheet_url, child.get("student_id"), ids, difficulty,
-        picked["count"], picked["type"], 1)
+        picked["count"], picked["type"], 1)          # is_offline=1 -> PDF
     if not url:
         return {"error": "generation_failed",
-                "message": ("Could not generate the PDF just now. Offer practice link instead.")}
+                "message": ("Could not generate the PDF just now. Offer the "
+                            "normal practice link instead.")}
 
     name = (child.get("first_name") or child.get("name") or "Practice").strip()
     safe_name = re.sub(r"[^A-Za-z0-9 _-]", "", name) or "Practice"
@@ -868,11 +935,12 @@ async def t_create_practice_pdf(s: dict, topic_ids: list, difficulty: str,
 
     if delivered:
         return {"ok": True, "delivered": "pdf_document", "child": name,
-                "message": ("PDF sent as a document in the chat.")}
-
+                "message": ("PDF sent as a document in the chat. Confirm in "
+                            "one short line.")}
     return {"link": url, "delivered": "pdf_link", "child": name,
             "difficulty": difficulty,
-            "message": ("PDF download link appended to your message.")}
+            "message": ("PDF download link appended to your message "
+                        "automatically. Say the paper is ready to download.")}
 
 
 async def t_get_report(s: dict) -> dict:
@@ -880,7 +948,8 @@ async def t_get_report(s: dict) -> dict:
         return {"error": "no_child", "message": "Select or register a child first."}
     if not usable_student_id(s["child"].get("student_id")):
         return {"error": "child_not_on_platform",
-                "message": ("Not on platform yet. Apologise and ask them to try shortly.")}
+                "message": ("Not on platform yet. Apologise and ask them to "
+                            "try shortly.")}
     reports = await asyncio.to_thread(
         _get_student_reports, s["child"].get("student_id"))
     if reports is None:
@@ -888,13 +957,15 @@ async def t_get_report(s: dict) -> dict:
                 "message": "Reports could not be loaded right now."}
     if not reports:
         return {"reports": 0,
-                "note": ("No completed practice yet. Tell them the report appears after completion.")}
+                "note": ("No completed practice yet. Tell them the report "
+                         "appears after their child finishes a practice set.")}
     latest = reports[0]
     return {"link": latest.get("report_link"),
             "title": latest.get("homework_quiz_title"),
             "total_reports": len(reports),
             "child": s["child"].get("first_name") or s["child"].get("name"),
-            "message": ("Latest report found. Write one short line; link is appended automatically.")}
+            "message": ("Latest report found. Write one short line; the link "
+                        "is appended automatically, never write it yourself.")}
 
 
 async def t_end_conversation(s: dict) -> dict:
@@ -933,8 +1004,7 @@ async def run_tool(name: str, args: dict, s: dict, phone: str) -> dict:
 # ---------------------------------------------------------------- agent loop
 async def agent_turn(phone: str, text: str) -> None:
     s = session_for(phone)
-    s["phone_full"] = phone
-
+    s["phone_full"] = phone          # used by tools that deliver directly
     history = sanitize_history(s["messages"])
     history.append({"role": "user", "content": text})
     log.info("IN  %s %r", phone[-4:], text[:80])
@@ -953,7 +1023,8 @@ async def agent_turn(phone: str, text: str) -> None:
             log.error("LLM error: %s | messages=%s",
                       e, json.dumps(history, default=str)[:2000])
             s["messages"] = trim_history(history)
-            await send_message(phone, "Something went wrong on our end. Please try again.")
+            await send_message(phone, "Something went wrong on our end. "
+                                      "Please try again in a moment.")
             return
 
         msg = resp.choices[0].message
@@ -1057,7 +1128,8 @@ async def receive(request: Request, background: BackgroundTasks):
 
         if text.lower() == "/reset":
             SESSIONS.pop(msg["from"], None)
-            background.add_task(send_message, msg["from"], "Session reset! Send any message to start fresh.")
+            background.add_task(send_message, msg["from"],
+                                "Session reset! Send any message to start fresh.")
             continue
 
         if text:
@@ -1072,7 +1144,6 @@ async def assessment_completed(request: Request, background: BackgroundTasks):
             request.headers.get("X-Callback-Secret") != PLATFORM_CALLBACK_SECRET:
         log.warning("Rejected report callback (bad secret)")
         return Response(status_code=403)
-
     try:
         data = await request.json()
     except Exception:
