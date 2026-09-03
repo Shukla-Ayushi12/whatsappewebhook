@@ -1,5 +1,6 @@
 import re
 import logging
+
 import requests
 
 log = logging.getLogger("whatsprep.registry")
@@ -48,12 +49,19 @@ class StudentRegistry:
 
     @staticmethod
     def _normalize_gender(gender: str) -> str:
+        """Map free-form gender words onto the values the platform accepts.
+
+        The bot's tool enum has always sent "Male"/"Female" (title case) and
+        registrations worked, so title case is what we keep sending. If the
+        platform ever rejects it wanting lowercase, change the two return
+        values below — the create-student log line will show the rejection.
+        """
         g = str(gender or "").strip().lower()
         if g in ("male", "boy", "guy", "m"):
-            return "male"
+            return "Male"
         if g in ("female", "girl", "f"):
-            return "female"
-        return g
+            return "Female"
+        return str(gender or "").strip()
 
     def _classify(self, response) -> str | None:
         """Map a response onto a last_error value. None means it's usable."""
@@ -79,7 +87,6 @@ class StudentRegistry:
         """Find students registered to a phone number.
 
         Returns a list of normalised student dicts, or None.
-
         None is ambiguous on its own, so always check `last_error`:
             last_error is None  -> genuinely no student for this number
             last_error is set   -> the lookup failed, do NOT register anyone
@@ -87,7 +94,6 @@ class StudentRegistry:
         self.last_error = None
         formatted = self._format_phone(phone)
         log.info("Looking up %s on platform", formatted)
-
         try:
             response = requests.post(
                 f"{self.base_url}/user-details-by-contact",
@@ -109,12 +115,10 @@ class StudentRegistry:
             return None
 
         log.info("Lookup status %s", response.status_code)
-
         problem = self._classify(response)
         if problem:
             self.last_error = problem
             return None
-
         if response.status_code == 404:
             log.info("No student found for %s", formatted)
             return None
@@ -132,7 +136,6 @@ class StudentRegistry:
                 log.info("No student found for %s", formatted)
                 return None
             return self._parse_students(records, phone)
-
         if isinstance(data, list):
             if not data:
                 log.info("No student found for %s", formatted)
@@ -149,14 +152,12 @@ class StudentRegistry:
         for s in records:
             class_obj = s.get("class") or {}
             classes_arr = s.get("classes") or []
-
             if isinstance(class_obj, dict) and class_obj.get("level_name"):
                 raw_level = class_obj.get("level_name", "")
             elif isinstance(classes_arr, list) and classes_arr:
                 raw_level = classes_arr[0].get("level_name", "")
             else:
                 raw_level = s.get("level", "")
-
             level = normalize_level(raw_level)
             if raw_level and not level:
                 log.warning("Student %s has a level we can't map: %r",
@@ -164,8 +165,9 @@ class StudentRegistry:
 
             first_name = (s.get("first_name") or "").strip()
             last_name = (s.get("last_name") or "").strip()
-            
-            full_name = s.get("name") or f"{first_name} {last_name}".strip() or "Unknown"
+            full_name = (s.get("name")
+                         or f"{first_name} {last_name}".strip()
+                         or "Unknown")
 
             result.append({
                 "student_id": s.get("id", ""),
@@ -192,14 +194,17 @@ class StudentRegistry:
         self.last_error = None
         formatted = self._format_phone(phone)
         level = normalize_level(level) or level
-
-        clean_first = first_name.strip()
-        clean_last = last_name.strip()
+        clean_first = (first_name or "").strip()
+        clean_last = (last_name or "").strip()
         clean_gender = self._normalize_gender(gender)
         full_name = f"{clean_first} {clean_last}".strip()
 
-        log.info("Registering %s (%s) on platform", full_name, level)
+        if not clean_first:
+            log.warning("Refusing to register a student with no first name")
+            self.last_error = "bad_request"
+            return None
 
+        log.info("Registering %s (%s) on platform", full_name, level)
         payload = {
             "first_name": clean_first,
             "last_name": clean_last,
@@ -207,7 +212,6 @@ class StudentRegistry:
             "level": level,
             "gender": clean_gender,
         }
-
         try:
             response = requests.post(
                 f"{self.base_url}/create-student",
@@ -215,7 +219,8 @@ class StudentRegistry:
                 json=payload,
                 timeout=10,
             )
-            log.info("Create student platform response (%s): %s", response.status_code, response.text[:300])
+            log.info("Create student platform response (%s): %s",
+                     response.status_code, response.text[:300])
         except requests.exceptions.Timeout:
             log.warning("Registration timed out for %s", full_name)
             self.last_error = "timeout"
@@ -229,15 +234,12 @@ class StudentRegistry:
             self.last_error = "error"
             return None
 
-        log.info("Registration status %s", response.status_code)
-
         problem = self._classify(response)
         if problem:
             self.last_error = problem
             if problem == "exists":
                 log.info("%s already exists on the platform", full_name)
             return None
-
         if response.status_code not in (200, 201):
             self.last_error = "unexpected"
             return None
@@ -258,8 +260,8 @@ class StudentRegistry:
 
         returned_first = student.get("first_name") or clean_first
         returned_last = student.get("last_name") or clean_last
-        returned_full = student.get("name") or f"{returned_first} {returned_last}".strip()
-
+        returned_full = (student.get("name")
+                         or f"{returned_first} {returned_last}".strip())
         log.info("Registered %s as %s", returned_full, student_id)
         return {
             "student_id": student_id,
@@ -323,3 +325,14 @@ if __name__ == "__main__":
             bad += 1
             print(f"MISMATCH {raw!r}: got {got!r}, expected {expected!r}")
     print("normalize_level: all pass" if not bad else f"{bad} failing")
+
+    g_cases = {"boy": "Male", "Boy": "Male", "m": "Male", "MALE": "Male",
+               "girl": "Female", "F": "Female", "female": "Female",
+               "Female": "Female", "": ""}
+    g_bad = 0
+    for raw, expected in g_cases.items():
+        got = StudentRegistry._normalize_gender(raw)
+        if got != expected:
+            g_bad += 1
+            print(f"GENDER MISMATCH {raw!r}: got {got!r}, expected {expected!r}")
+    print("normalize_gender: all pass" if not g_bad else f"{g_bad} failing")
